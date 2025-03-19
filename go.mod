@@ -8,6 +8,7 @@ require (
 	github.com/spf13/viper v1.20.0
 	github.com/ulikunitz/xz v0.5.6
 	go.uber.org/zap v1.27.0
+	howett.net/plist v1.0.1
 )
 
 require (

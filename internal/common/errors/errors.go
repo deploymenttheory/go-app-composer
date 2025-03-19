@@ -43,4 +43,7 @@ var (
 	ErrHTTPStatusFailed = errors.New("unexpected HTTP status code during download")
 	ErrFileCreateFailed = errors.New("failed to create destination file")
 	ErrFileWriteFailed  = errors.New("failed to write to file during download")
+
+	// Hash Errors
+	ErrInvalidHasher = errors.New("invalid hasher")
 )
