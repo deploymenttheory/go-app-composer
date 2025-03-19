@@ -1,0 +1,53 @@
+# go-app-composer configuration file
+
+# Core settings
+debug: false
+log_format: "human" # Options: "human" or "json"
+log_file: "logs/tooling.log"
+
+# MDM settings
+mdm:
+  provider: "jamf" # Options: "jamf", "intune", "mosyle", or leave empty for none
+  
+  # Jamf Pro settings (only used when provider is "jamf")
+  jamf:
+    url: "https://your-jamf-instance.jamfcloud.com"
+    username: "api-username"
+    password: "api-password"
+  
+  # Intune settings (only used when provider is "intune")
+  intune:
+    tenant_id: "your-tenant-id"
+    client_id: "your-client-id"
+    client_secret: "your-client-secret"
+  
+  # Mosyle settings (only used when provider is "mosyle")
+  mosyle:
+    api_key: "your-api-key"
+    domain: "your-domain"
+
+# Storage settings
+storage:
+  provider: "s3" # Options: "s3", "gcp", or leave empty for none
+  
+  # S3 settings (only used when provider is "s3")
+  s3:
+    bucket: "your-bucket-name"
+    region: "us-west-2"
+    access_key: "your-access-key"
+    secret_key: "your-secret-key"
+    endpoint: "" # Optional: for S3-compatible storage
+    disable_ssl: false # Optional: for development/testing
+  
+  # GCP settings (only used when provider is "gcp")
+  gcp:
+    bucket: "your-gcp-bucket"
+    credentials_file: "path/to/credentials.json"
+    project_id: "your-project-id"
+
+# Packaging settings
+packaging:
+  temp_dir: "temp" # Directory for temporary files
+  cache_dir: "cache" # Directory for cached files
+  signing_id: "Developer ID Application: Your Name (TEAMID)" # For code signing
+  notarization_id: "your@apple.id" # For macOS notarization

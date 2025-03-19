@@ -1,0 +1,90 @@
+# Sample Chrome Enterprise Workflow
+name: "Chrome Enterprise Package"
+description: "Downloads Chrome Enterprise, configures settings, and uploads to MDM"
+version: "1.0.0"
+author: "IT Department"
+
+# Define variables that can be referenced in steps
+variables:
+  chrome_version: "120.0.6099.216"
+  org_name: "Acme Inc"
+  policy_source: "configs/chrome-policy.json"
+
+# Workflow Steps
+steps:
+  - name: "Download Chrome Enterprise"
+    type: "download"
+    description: "Download the latest Chrome Enterprise installer"
+    parameters:
+      url: "https://dl.google.com/chrome/mac/stable/gcem/GoogleChrome.pkg"
+      output: "{{temp_dir}}/GoogleChrome.pkg"
+      checksum_type: "sha256"
+      checksum: "abc123def456" # Replace with actual checksum
+      timeout: 300 # seconds
+
+  - name: "Extract Package"
+    type: "extract"
+    description: "Extract the pkg to modify contents"
+    parameters:
+      input: "{{temp_dir}}/GoogleChrome.pkg"
+      output: "{{temp_dir}}/Chrome_extracted"
+
+  - name: "Add Configuration Profile"
+    type: "add_file"
+    description: "Add our custom configuration"
+    parameters:
+      source: "{{policy_source}}"
+      destination: "{{temp_dir}}/Chrome_extracted/Library/Managed Preferences/com.google.Chrome.plist"
+      mode: "0644"
+
+  - name: "Add Custom Bookmarks"
+    type: "add_file"
+    description: "Add company bookmarks"
+    parameters:
+      source: "configs/bookmarks.json"
+      destination: "{{temp_dir}}/Chrome_extracted/Library/Application Support/Google/Chrome/Default/Bookmarks"
+      mode: "0644"
+
+  - name: "Repackage"
+    type: "package"
+    description: "Create a new package with our modifications"
+    parameters:
+      input: "{{temp_dir}}/Chrome_extracted"
+      output: "{{temp_dir}}/GoogleChrome_{{org_name}}_{{chrome_version}}.pkg"
+      identifier: "com.{{org_name}}.pkg.google.chrome"
+      version: "{{chrome_version}}"
+      scripts_dir: "scripts/chrome"
+
+  - name: "Sign Package"
+    type: "sign"
+    description: "Sign the package with our Developer ID"
+    condition: "{{config.Instance.Packaging.SigningID != ''}}"
+    parameters:
+      input: "{{temp_dir}}/GoogleChrome_{{org_name}}_{{chrome_version}}.pkg"
+      identity: "{{config.Instance.Packaging.SigningID}}"
+
+  - name: "Virus Scan"
+    type: "scan"
+    description: "Scan the package for malware"
+    parameters:
+      input: "{{temp_dir}}/GoogleChrome_{{org_name}}_{{chrome_version}}.pkg"
+      scanner: "clamscan"
+      options: "--recursive=yes --infected"
+
+  - name: "Upload to Jamf"
+    type: "upload"
+    description: "Upload to Jamf Pro"
+    condition: "{{config.Instance.MDM.Provider == 'jamf'}}"
+    parameters:
+      input: "{{temp_dir}}/GoogleChrome_{{org_name}}_{{chrome_version}}.pkg"
+      destination: "jamf"
+      category: "Browsers"
+      description: "Google Chrome Enterprise {{chrome_version}} with {{org_name}} configuration"
+      priority: "high"
+
+  - name: "Cleanup"
+    type: "delete"
+    description: "Clean up temporary files"
+    parameters:
+      path: "{{temp_dir}}/Chrome_extracted"
+      recursive: true
