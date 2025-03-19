@@ -273,6 +273,11 @@ func IsDirEmpty(path string) (bool, error) {
 	return len(entries) == 0, nil
 }
 
+// GetDir returns the directory of a given file path
+func GetDir(path string) string {
+	return filepath.Dir(path)
+}
+
 // GetDirSize calculates the total size of a directory and its contents
 func GetDirSize(path string) (int64, error) {
 	var size int64

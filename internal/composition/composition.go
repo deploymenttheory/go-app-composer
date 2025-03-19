@@ -184,8 +184,21 @@ func ValidateWorkflow(workflow *Workflow) []error {
 // isValidStepType checks if a step type is valid
 func isValidStepType(stepType string) bool {
 	validTypes := []string{
-		"download", "extract", "package", "add_file", "scan", "sign",
-		"notarize", "upload", "delete", "move", "copy", "exec", "script",
+		"download",
+		"compress",
+		"extract",
+		"package",
+		"add_file",
+		"scan",
+		"sign",
+		"notarize",
+		"upload",
+		"delete",
+		"move",
+		"copy",
+		"exec",
+		"script",
+		"edit_plist",
 	}
 
 	for _, validType := range validTypes {
@@ -216,6 +229,17 @@ func validateStepParameters(step Step) []error {
 		}
 		if _, ok := step.Parameters["output"]; !ok {
 			errors = append(errors, fmt.Errorf("missing required parameter 'output'"))
+		}
+
+	case "compress":
+		if _, ok := step.Parameters["source"]; !ok {
+			errors = append(errors, fmt.Errorf("missing required parameter 'source'"))
+		}
+		if _, ok := step.Parameters["destination"]; !ok {
+			errors = append(errors, fmt.Errorf("missing required parameter 'destination'"))
+		}
+		if _, ok := step.Parameters["format"]; !ok {
+			errors = append(errors, fmt.Errorf("missing required parameter 'format'"))
 		}
 
 	case "package":
@@ -255,6 +279,38 @@ func validateStepParameters(step Step) []error {
 	case "script":
 		if _, ok := step.Parameters["script"]; !ok && step.Parameters["file"] == nil {
 			errors = append(errors, fmt.Errorf("missing required parameter 'script' or 'file'"))
+		}
+
+	case "edit_plist":
+		if _, ok := step.Parameters["path"]; !ok {
+			errors = append(errors, fmt.Errorf("missing required parameter 'path'"))
+		}
+		if operation, ok := step.Parameters["operation"].(string); ok {
+			switch operation {
+			case "set":
+				if _, ok := step.Parameters["key"]; !ok {
+					errors = append(errors, fmt.Errorf("missing required parameter 'key' for 'set' operation"))
+				}
+				if _, ok := step.Parameters["value"]; !ok {
+					errors = append(errors, fmt.Errorf("missing required parameter 'value' for 'set' operation"))
+				}
+			case "delete":
+				if _, ok := step.Parameters["key"]; !ok {
+					errors = append(errors, fmt.Errorf("missing required parameter 'key' for 'delete' operation"))
+				}
+			case "merge":
+				if _, ok := step.Parameters["source"]; !ok {
+					errors = append(errors, fmt.Errorf("missing required parameter 'source' for 'merge' operation"))
+				}
+			case "convert":
+				if _, ok := step.Parameters["format"]; !ok {
+					errors = append(errors, fmt.Errorf("missing required parameter 'format' for 'convert' operation"))
+				}
+			default:
+				errors = append(errors, fmt.Errorf("invalid operation '%s' for 'edit_plist'", operation))
+			}
+		} else {
+			errors = append(errors, fmt.Errorf("missing required parameter 'operation' for 'edit_plist'"))
 		}
 	}
 
@@ -304,11 +360,12 @@ func ExecuteWorkflow(workflow *Workflow) error {
 			return fmt.Errorf("error executing step '%s': %w", step.Name, err)
 		}
 
-		// Update the workflow variables with the result
-		if result != nil {
-			for k, v := range result {
-				workflow.Variables[k] = v
+		// Update the workflow variables with the result, ensuring no unintended overwrites
+		for k, v := range result {
+			if existing, exists := workflow.Variables[k]; exists {
+				logger.LogWarn(fmt.Sprintf("Variable '%s' is being overwritten. Old: %v, New: %v", k, existing, v), nil)
 			}
+			workflow.Variables[k] = v
 		}
 
 		logger.LogInfo(fmt.Sprintf("Completed step %d/%d: %s", i+1, len(workflow.Steps), step.Name), nil)
