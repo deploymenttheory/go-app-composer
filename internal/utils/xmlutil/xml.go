@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/errors"
-	"github.com/deploymenttheory/go-app-composer/internal/common/fsutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/errors"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
 )
 
 // CreateXMLFile creates a new XML file with the given root element.

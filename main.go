@@ -7,9 +7,9 @@ import (
 
 	"github.com/deploymenttheory/go-app-composer/cmd"
 	"github.com/deploymenttheory/go-app-composer/internal/bootstrap"
-	logger "github.com/deploymenttheory/go-app-composer/internal/common/zap_logger"
 	"github.com/deploymenttheory/go-app-composer/internal/composition"
 	"github.com/deploymenttheory/go-app-composer/internal/config"
+	"github.com/deploymenttheory/go-app-composer/internal/logger"
 )
 
 // Mode constants

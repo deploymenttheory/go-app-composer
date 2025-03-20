@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/osutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/osutil"
 )
 
 // PathSeparator returns the OS-specific path separator character

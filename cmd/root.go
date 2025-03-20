@@ -3,9 +3,9 @@ package cmd
 import (
 	"fmt"
 
-	logger "github.com/deploymenttheory/go-app-composer/internal/common/zap_logger"
 	"github.com/deploymenttheory/go-app-composer/internal/composition"
 	"github.com/deploymenttheory/go-app-composer/internal/config"
+	"github.com/deploymenttheory/go-app-composer/internal/logger"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )

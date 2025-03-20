@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	compression "github.com/deploymenttheory/go-app-composer/internal/common/compressionutil"
-	errors "github.com/deploymenttheory/go-app-composer/internal/common/errors"
-	"github.com/deploymenttheory/go-app-composer/internal/common/fsutil"
-	"github.com/deploymenttheory/go-app-composer/internal/common/plistutil"
-	"github.com/deploymenttheory/go-app-composer/internal/common/urlutil"
-	logger "github.com/deploymenttheory/go-app-composer/internal/common/zap_logger"
+	"github.com/deploymenttheory/go-app-composer/internal/logger"
+	compression "github.com/deploymenttheory/go-app-composer/internal/utils/compressionutil"
+	errors "github.com/deploymenttheory/go-app-composer/internal/utils/errors"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/plistutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/urlutil"
 )
 
 // StepHandler is a function that executes a workflow step

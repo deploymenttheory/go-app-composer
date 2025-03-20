@@ -14,7 +14,7 @@ import (
 	"os"
 	"strings"
 
-	commonerrors "github.com/deploymenttheory/go-app-composer/internal/common/errors"
+	commonerrors "github.com/deploymenttheory/go-app-composer/internal/utils/errors"
 )
 
 // Custom errors

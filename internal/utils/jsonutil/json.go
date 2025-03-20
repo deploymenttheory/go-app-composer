@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/errors"
-	"github.com/deploymenttheory/go-app-composer/internal/common/fsutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/errors"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
 )
 
 // JSONFormat represents the formatting style for JSON files

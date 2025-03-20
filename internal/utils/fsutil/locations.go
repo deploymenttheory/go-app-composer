@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/osutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/osutil"
 )
 
 // GetHomeDir returns the user's home directory

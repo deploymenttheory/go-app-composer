@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/fsutil"
-	"github.com/deploymenttheory/go-app-composer/internal/common/osutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/osutil"
 	"github.com/spf13/viper"
 )
 

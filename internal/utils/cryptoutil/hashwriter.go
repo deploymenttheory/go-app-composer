@@ -3,7 +3,7 @@ package cryptoutil
 import (
 	"hash"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/errors"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/errors"
 )
 
 // HashWriter implements io.Writer and provides methods to access the underlying hash

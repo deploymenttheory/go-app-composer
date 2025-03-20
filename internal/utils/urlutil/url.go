@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/cryptoutil"
-	"github.com/deploymenttheory/go-app-composer/internal/common/errors"
-	"github.com/deploymenttheory/go-app-composer/internal/common/fsutil"
-	logger "github.com/deploymenttheory/go-app-composer/internal/common/zap_logger"
+	"github.com/deploymenttheory/go-app-composer/internal/logger"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/cryptoutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/errors"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
 )
 
 // DownloadOptions represents options for downloading files

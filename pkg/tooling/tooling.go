@@ -5,9 +5,9 @@ import (
 	"os"
 	"strings"
 
-	logger "github.com/deploymenttheory/go-app-composer/internal/common/zap_logger"
 	"github.com/deploymenttheory/go-app-composer/internal/composition"
 	"github.com/deploymenttheory/go-app-composer/internal/config"
+	"github.com/deploymenttheory/go-app-composer/internal/logger"
 )
 
 // InitOptions contains options for initializing the tooling API

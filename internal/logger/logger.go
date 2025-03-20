@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/fsutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )

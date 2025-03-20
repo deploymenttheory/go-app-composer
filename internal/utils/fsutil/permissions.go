@@ -11,8 +11,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/deploymenttheory/go-app-composer/internal/common/errors"
-	"github.com/deploymenttheory/go-app-composer/internal/common/osutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/errors"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/osutil"
 )
 
 // PermissionMode represents a file permission mode
