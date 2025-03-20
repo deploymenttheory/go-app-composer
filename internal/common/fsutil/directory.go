@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,6 +26,10 @@ type DirEntry struct {
 
 // DirExists checks if a directory exists
 func DirExists(path string) bool {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return false
@@ -34,7 +39,13 @@ func DirExists(path string) bool {
 
 // CreateDir creates a directory if it doesn't exist
 func CreateDir(path string, perm os.FileMode) error {
-	if DirExists(path) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check again under lock
+	info, err := os.Stat(path)
+	if err == nil && info.IsDir() {
 		return nil // Directory already exists
 	}
 	return os.MkdirAll(path, perm)
@@ -47,7 +58,13 @@ func CreateDirIfNotExists(path string) error {
 
 // DeleteDir removes an empty directory
 func DeleteDir(path string) error {
-	if !DirExists(path) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check under lock
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
 		return nil // Directory doesn't exist, nothing to do
 	}
 	return os.Remove(path)
@@ -55,7 +72,13 @@ func DeleteDir(path string) error {
 
 // DeleteDirRecursive removes a directory and all its contents
 func DeleteDirRecursive(path string) error {
-	if !DirExists(path) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check under lock
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
 		return nil // Directory doesn't exist, nothing to do
 	}
 	return os.RemoveAll(path)
@@ -63,7 +86,13 @@ func DeleteDirRecursive(path string) error {
 
 // CleanDir removes all contents from a directory without removing the directory itself
 func CleanDir(path string) error {
-	if !DirExists(path) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check under lock
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
 		return fmt.Errorf("directory does not exist: %s", path)
 	}
 
@@ -77,10 +106,15 @@ func CleanDir(path string) error {
 	for _, entry := range entries {
 		entryPath := filepath.Join(path, entry.Name())
 		if entry.IsDir() {
-			if err := DeleteDirRecursive(entryPath); err != nil {
+			// Release parent directory lock to avoid deadlocks during recursive deletion
+			mu.Unlock()
+			err := DeleteDirRecursive(entryPath)
+			mu.Lock() // Reacquire lock for parent directory
+			if err != nil {
 				return err
 			}
 		} else {
+			// For files, we can just remove while holding the parent directory lock
 			if err := os.Remove(entryPath); err != nil {
 				return err
 			}
@@ -92,6 +126,10 @@ func CleanDir(path string) error {
 
 // CopyDir recursively copies a directory and its contents
 func CopyDir(src, dst string) error {
+	// Lock both source and destination to prevent concurrent modifications
+	unlock := acquireMutexes(src, dst)
+	defer unlock()
+
 	// Get info about the source directory
 	srcInfo, err := os.Stat(src)
 	if err != nil {
@@ -116,16 +154,23 @@ func CopyDir(src, dst string) error {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 
+		// Release locks to avoid deadlocks during recursive operations
+		unlock()
+
+		var err error
 		if entry.IsDir() {
 			// Recursively copy subdirectory
-			if err := CopyDir(srcPath, dstPath); err != nil {
-				return err
-			}
+			err = CopyDir(srcPath, dstPath)
 		} else {
 			// Copy file
-			if err := CopyFile(srcPath, dstPath); err != nil {
-				return err
-			}
+			err = CopyFile(srcPath, dstPath)
+		}
+
+		// Reacquire locks
+		unlock = acquireMutexes(src, dst)
+
+		if err != nil {
+			return err
 		}
 	}
 
@@ -134,12 +179,19 @@ func CopyDir(src, dst string) error {
 
 // MoveDir moves a directory from source to destination
 func MoveDir(src, dst string) error {
+	// Lock both source and destination
+	unlock := acquireMutexes(src, dst)
+	defer unlock()
+
 	// Try the atomic rename operation first
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
 
-	// If rename fails (e.g., cross-device), fall back to copy and delete
+	// If rename fails (e.g., cross-device), release locks to prevent deadlocks
+	unlock()
+
+	// Fall back to copy and delete
 	if err := CopyDir(src, dst); err != nil {
 		return err
 	}
@@ -149,7 +201,13 @@ func MoveDir(src, dst string) error {
 
 // ListDir returns a list of all files and directories in a directory (non-recursive)
 func ListDir(path string) ([]DirEntry, error) {
-	if !DirExists(path) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check under lock
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("directory does not exist: %s", path)
 	}
 
@@ -216,12 +274,37 @@ func ListDirs(path string) ([]DirEntry, error) {
 
 // WalkDir walks a directory recursively and calls a function for each entry
 func WalkDir(root string, fn func(path string, info fs.FileInfo, err error) error) error {
-	return filepath.Walk(root, fn)
+	// For WalkDir, we need a more complex approach since we'll be traversing
+	// multiple directories. We'll use a visitor pattern that acquires and releases
+	// locks for each directory as it's processed.
+
+	visitor := func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return fn(path, info, err)
+		}
+
+		// Lock the current path
+		mu := GetPathMutex(path)
+		mu.Lock()
+		defer mu.Unlock()
+
+		// If path no longer exists, report it
+		if _, statErr := os.Stat(path); statErr != nil {
+			return fn(path, info, statErr)
+		}
+
+		// Call the user-provided function with the lock held
+		return fn(path, info, nil)
+	}
+
+	return filepath.Walk(root, visitor)
 }
 
 // FindFiles finds all files matching a pattern in a directory (recursive)
 func FindFiles(root, pattern string) ([]string, error) {
 	var matches []string
+	var mu sync.Mutex // Mutex to protect concurrent writes to matches slice
+
 	err := WalkDir(root, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -232,7 +315,9 @@ func FindFiles(root, pattern string) ([]string, error) {
 				return err
 			}
 			if match {
+				mu.Lock()
 				matches = append(matches, path)
+				mu.Unlock()
 			}
 		}
 		return nil
@@ -247,12 +332,16 @@ func FindFilesByExt(root, ext string) ([]string, error) {
 	}
 
 	var matches []string
+	var mu sync.Mutex // Mutex to protect concurrent writes to matches slice
+
 	err := WalkDir(root, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), strings.ToLower(ext)) {
+			mu.Lock()
 			matches = append(matches, path)
+			mu.Unlock()
 		}
 		return nil
 	})
@@ -261,7 +350,13 @@ func FindFilesByExt(root, ext string) ([]string, error) {
 
 // IsDirEmpty checks if a directory is empty
 func IsDirEmpty(path string) (bool, error) {
-	if !DirExists(path) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check under lock
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
 		return false, fmt.Errorf("directory does not exist: %s", path)
 	}
 
@@ -274,6 +369,7 @@ func IsDirEmpty(path string) (bool, error) {
 }
 
 // GetDir returns the directory of a given file path
+// This is a pure path operation that doesn't access the filesystem, so no locking needed
 func GetDir(path string) string {
 	return filepath.Dir(path)
 }
@@ -281,12 +377,16 @@ func GetDir(path string) string {
 // GetDirSize calculates the total size of a directory and its contents
 func GetDirSize(path string) (int64, error) {
 	var size int64
+	var mu sync.Mutex // Mutex to protect the size counter
+
 	err := WalkDir(path, func(_ string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
+			mu.Lock()
 			size += info.Size()
+			mu.Unlock()
 		}
 		return nil
 	})
@@ -333,20 +433,36 @@ func GetOldestFile(path string) (*DirEntry, error) {
 
 // EnsureEmptyDir ensures a directory exists and is empty
 func EnsureEmptyDir(path string) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// If directory exists, clean it
-	if DirExists(path) {
-		return CleanDir(path)
+	info, err := os.Stat(path)
+	if err == nil && info.IsDir() {
+		// Release lock to avoid deadlock in CleanDir
+		mu.Unlock()
+		err := CleanDir(path)
+		mu.Lock() // Reacquire lock
+		return err
 	}
 
 	// Create new directory
-	return CreateDirIfNotExists(path)
+	return os.MkdirAll(path, 0755)
 }
 
 // CopyDirContents copies the contents of a directory without recreating the source directory
 func CopyDirContents(src, dst string) error {
+	// Lock both source and destination
+	unlock := acquireMutexes(src, dst)
+	defer unlock()
+
 	// Create destination if it doesn't exist
-	if err := CreateDirIfNotExists(dst); err != nil {
-		return err
+	info, err := os.Stat(dst)
+	if err != nil || !info.IsDir() {
+		if err := os.MkdirAll(dst, 0755); err != nil {
+			return err
+		}
 	}
 
 	// Get source contents
@@ -359,14 +475,21 @@ func CopyDirContents(src, dst string) error {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 
+		// Release locks to avoid deadlocks during recursive operations
+		unlock()
+
+		var err error
 		if entry.IsDir() {
-			if err := CopyDir(srcPath, dstPath); err != nil {
-				return err
-			}
+			err = CopyDir(srcPath, dstPath)
 		} else {
-			if err := CopyFile(srcPath, dstPath); err != nil {
-				return err
-			}
+			err = CopyFile(srcPath, dstPath)
+		}
+
+		// Reacquire locks
+		unlock = acquireMutexes(src, dst)
+
+		if err != nil {
+			return err
 		}
 	}
 
@@ -375,6 +498,10 @@ func CopyDirContents(src, dst string) error {
 
 // IsSymlink checks if a path is a symlink
 func IsSymlink(path string) (bool, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Lstat(path)
 	if err != nil {
 		return false, err
@@ -385,13 +512,19 @@ func IsSymlink(path string) (bool, error) {
 
 // CreateTempDir creates a temporary directory with a prefix
 func CreateTempDir(prefix string) (string, error) {
+	// No need to lock here as os.MkdirTemp handles atomicity
 	return os.MkdirTemp("", prefix)
 }
 
 // CreateTempDirIn creates a temporary directory with a prefix in a specific directory
 func CreateTempDirIn(dir, prefix string) (string, error) {
-	if !DirExists(dir) {
-		if err := CreateDirIfNotExists(dir); err != nil {
+	mu := GetPathMutex(dir)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check if directory exists and create if needed
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0755); err != nil {
 			return "", err
 		}
 	}
@@ -401,6 +534,10 @@ func CreateTempDirIn(dir, prefix string) (string, error) {
 
 // CopySymlink copies a symlink from source to destination
 func CopySymlink(src, dst string) error {
+	// Lock both source and destination
+	unlock := acquireMutexes(src, dst)
+	defer unlock()
+
 	// Read the target of the symlink
 	target, err := os.Readlink(src)
 	if err != nil {
@@ -408,13 +545,18 @@ func CopySymlink(src, dst string) error {
 	}
 
 	// Create parent directory if needed
-	if err := CreateDirIfNotExists(filepath.Dir(dst)); err != nil {
-		return err
+	parentDir := filepath.Dir(dst)
+	if _, err := os.Stat(parentDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(parentDir, 0755); err != nil {
+			return err
+		}
 	}
 
 	// Remove destination if it exists
-	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		return err
+	if _, err := os.Lstat(dst); err == nil {
+		if err := os.Remove(dst); err != nil {
+			return err
+		}
 	}
 
 	// Create the symlink

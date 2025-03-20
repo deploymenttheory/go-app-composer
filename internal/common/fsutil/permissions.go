@@ -60,6 +60,10 @@ const (
 
 // GetPermissions retrieves the permissions of a file or directory
 func GetPermissions(path string) (os.FileMode, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -75,6 +79,10 @@ func GetPermissions(path string) (os.FileMode, error) {
 
 // SetPermissions sets the permissions of a file or directory
 func SetPermissions(path string, mode os.FileMode) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	err := os.Chmod(path, mode)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -90,6 +98,10 @@ func SetPermissions(path string, mode os.FileMode) error {
 
 // IsReadable checks if a file or directory is readable by the current user
 func IsReadable(path string) bool {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	file, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return false
@@ -100,6 +112,10 @@ func IsReadable(path string) bool {
 
 // IsWritable checks if a file or directory is writable by the current user
 func IsWritable(path string) bool {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// For directories, check if we can create a temporary file
 	info, err := os.Stat(path)
 	if err != nil {
@@ -128,6 +144,10 @@ func IsWritable(path string) bool {
 
 // IsExecutable checks if a file is executable by the current user
 func IsExecutable(path string) bool {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return false
@@ -145,6 +165,10 @@ func IsExecutable(path string) bool {
 
 // GetOwner gets the owner of a file or directory
 func GetOwner(path string) (string, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -157,7 +181,11 @@ func GetOwner(path string) (string, error) {
 	}
 
 	if osutil.IsWindows() {
-		return getWindowsOwner(path)
+		// Release lock for external command execution to avoid deadlocks
+		mu.Unlock()
+		owner, err := getWindowsOwner(path)
+		mu.Lock() // Reacquire lock
+		return owner, err
 	}
 
 	// On Unix-like systems
@@ -174,8 +202,9 @@ func GetOwner(path string) (string, error) {
 }
 
 // getWindowsOwner gets the owner of a file on Windows
-// This is a platform-safe implementation that doesn't require golang.org/x/sys/windows
 func getWindowsOwner(path string) (string, error) {
+	// This function is called internally with mutex protection
+
 	// Convert to absolute path to ensure proper resolution
 	absPath, err := filepath.Abs(path)
 	if err != nil {
@@ -219,6 +248,10 @@ func hasPowerShell() bool {
 
 // SetOwner sets the owner of a file or directory
 func SetOwner(path string, username string) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Not fully supported on Windows, but we'll provide a better error
 	if osutil.IsWindows() {
 		return fmt.Errorf("%w: changing file ownership on Windows requires special privileges. Use icacls.exe or PowerShell Set-Acl", errors.ErrOSNotSupported)
@@ -259,6 +292,10 @@ func SetOwner(path string, username string) error {
 
 // GetGroup gets the group of a file or directory
 func GetGroup(path string) (string, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -271,7 +308,11 @@ func GetGroup(path string) (string, error) {
 	}
 
 	if osutil.IsWindows() {
-		return getWindowsGroup(path)
+		// Release lock before external command execution
+		mu.Unlock()
+		group, err := getWindowsGroup(path)
+		mu.Lock() // Reacquire lock
+		return group, err
 	}
 
 	// On Unix-like systems
@@ -289,6 +330,8 @@ func GetGroup(path string) (string, error) {
 
 // getWindowsGroup gets the primary group associated with a file on Windows
 func getWindowsGroup(path string) (string, error) {
+	// This function is called with mutex handling by the caller
+
 	// If PowerShell is available, try to get primary group
 	if hasPowerShell() {
 		output, err := exec.Command("powershell", "-Command",
@@ -307,6 +350,10 @@ func getWindowsGroup(path string) (string, error) {
 
 // SetGroup sets the group of a file or directory
 func SetGroup(path string, groupname string) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if osutil.IsWindows() {
 		return fmt.Errorf("%w: changing file group on Windows requires special privileges. Use icacls.exe or PowerShell Set-Acl", errors.ErrOSNotSupported)
 	}
@@ -352,6 +399,10 @@ func SetGroup(path string, groupname string) error {
 
 // MakeReadOnly makes a file or directory read-only
 func MakeReadOnly(path string) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Check if file exists
 	info, err := os.Stat(path)
 	if err != nil {
@@ -362,7 +413,11 @@ func MakeReadOnly(path string) error {
 	}
 
 	if osutil.IsWindows() {
-		return setWindowsReadOnly(path, true)
+		// Release lock for external command
+		mu.Unlock()
+		err := setWindowsReadOnly(path, true)
+		mu.Lock() // Reacquire lock
+		return err
 	}
 
 	// For Unix systems
@@ -379,6 +434,8 @@ func MakeReadOnly(path string) error {
 
 // setWindowsReadOnly sets or clears the read-only attribute on Windows
 func setWindowsReadOnly(path string, readOnly bool) error {
+	// This function is called with mutex handling by the caller
+
 	if readOnly {
 		// Use attrib command to set read-only flag
 		cmd := exec.Command("attrib", "+r", path)
@@ -397,6 +454,10 @@ func setWindowsReadOnly(path string, readOnly bool) error {
 
 // MakeWritable makes a file or directory writable
 func MakeWritable(path string) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Check if file exists
 	info, err := os.Stat(path)
 	if err != nil {
@@ -407,7 +468,11 @@ func MakeWritable(path string) error {
 	}
 
 	if osutil.IsWindows() {
-		return setWindowsReadOnly(path, false)
+		// Release lock for external command
+		mu.Unlock()
+		err := setWindowsReadOnly(path, false)
+		mu.Lock() // Reacquire lock
+		return err
 	}
 
 	// For Unix systems
@@ -424,9 +489,14 @@ func MakeWritable(path string) error {
 
 // SetRecursivePermissions sets permissions recursively on a directory
 func SetRecursivePermissions(path string, dirMode, fileMode os.FileMode) error {
+	// Lock the root path
+	rootMu := GetPathMutex(path)
+	rootMu.Lock()
+
 	// Check if directory exists
 	info, err := os.Stat(path)
 	if err != nil {
+		rootMu.Unlock()
 		if os.IsNotExist(err) {
 			return fmt.Errorf("%w: %s", errors.ErrDirNotFound, path)
 		}
@@ -434,13 +504,22 @@ func SetRecursivePermissions(path string, dirMode, fileMode os.FileMode) error {
 	}
 
 	if !info.IsDir() {
+		rootMu.Unlock()
 		return fmt.Errorf("%w: %s is not a directory", errors.ErrInvalidArgument, path)
 	}
+
+	// Release root lock before walking to avoid deadlocks
+	rootMu.Unlock()
 
 	return filepath.Walk(path, func(name string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
+
+		// Lock each path individually during walk
+		mu := GetPathMutex(name)
+		mu.Lock()
+		defer mu.Unlock()
 
 		var chmodErr error
 		if info.IsDir() {
@@ -462,6 +541,10 @@ func SetRecursivePermissions(path string, dirMode, fileMode os.FileMode) error {
 
 // IsSymlinkTo checks if a path is a symlink pointing to a specific target
 func IsSymlinkTo(path, target string) (bool, error) {
+	// Lock both paths to ensure consistency
+	unlock := acquireMutexes(path, target)
+	defer unlock()
+
 	linkTarget, err := os.Readlink(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -479,8 +562,16 @@ func IsSymlinkTo(path, target string) (bool, error) {
 
 // GetFileAttributes gets platform-specific file attributes
 func GetFileAttributes(path string) (string, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if osutil.IsWindows() {
-		return getWindowsFileAttributes(path)
+		// Release lock for external command
+		mu.Unlock()
+		attrs, err := getWindowsFileAttributes(path)
+		mu.Lock() // Reacquire lock
+		return attrs, err
 	}
 
 	// For Unix, return the formatted permissions
@@ -498,6 +589,8 @@ func GetFileAttributes(path string) (string, error) {
 
 // getWindowsFileAttributes returns Windows-specific file attributes as a string
 func getWindowsFileAttributes(path string) (string, error) {
+	// This function is called with mutex handling by the caller
+
 	// Check if file exists
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
@@ -596,6 +689,10 @@ func GetWindowsAttributes(path string) (WindowsFileAttributes, error) {
 
 // isFileReadOnly checks if a file is read-only on Windows
 func isFileReadOnly(path string) (bool, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return false, err
@@ -617,6 +714,10 @@ func isFileReadOnly(path string) (bool, error) {
 
 // SetWindowsAttributes sets Windows-specific file attributes
 func SetWindowsAttributes(path string, attrs WindowsFileAttributes) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if !osutil.IsWindows() {
 		return fmt.Errorf("%w: Windows attributes are only available on Windows", errors.ErrOSNotSupported)
 	}
@@ -629,13 +730,18 @@ func SetWindowsAttributes(path string, attrs WindowsFileAttributes) error {
 		return fmt.Errorf("%w: %s", errors.ErrPathNotAccessible, path)
 	}
 
+	// Release lock for external commands
+	mu.Unlock()
+
 	// Handle read-only attribute
 	if attrs&WinAttrReadOnly != 0 {
 		if err := setWindowsReadOnly(path, true); err != nil {
+			mu.Lock() // Reacquire lock
 			return err
 		}
 	} else {
 		if err := setWindowsReadOnly(path, false); err != nil {
+			mu.Lock() // Reacquire lock
 			return err
 		}
 	}
@@ -643,10 +749,12 @@ func SetWindowsAttributes(path string, attrs WindowsFileAttributes) error {
 	// Handle hidden attribute using attrib
 	if attrs&WinAttrHidden != 0 {
 		if err := exec.Command("attrib", "+h", path).Run(); err != nil {
+			mu.Lock() // Reacquire lock
 			return fmt.Errorf("%w: failed to set hidden attribute", errors.ErrFilePermissionError)
 		}
 	} else {
 		if err := exec.Command("attrib", "-h", path).Run(); err != nil {
+			mu.Lock() // Reacquire lock
 			return fmt.Errorf("%w: failed to clear hidden attribute", errors.ErrFilePermissionError)
 		}
 	}
@@ -654,10 +762,12 @@ func SetWindowsAttributes(path string, attrs WindowsFileAttributes) error {
 	// Handle system attribute using attrib
 	if attrs&WinAttrSystem != 0 {
 		if err := exec.Command("attrib", "+s", path).Run(); err != nil {
+			mu.Lock() // Reacquire lock
 			return fmt.Errorf("%w: failed to set system attribute", errors.ErrFilePermissionError)
 		}
 	} else {
 		if err := exec.Command("attrib", "-s", path).Run(); err != nil {
+			mu.Lock() // Reacquire lock
 			return fmt.Errorf("%w: failed to clear system attribute", errors.ErrFilePermissionError)
 		}
 	}
@@ -665,23 +775,36 @@ func SetWindowsAttributes(path string, attrs WindowsFileAttributes) error {
 	// Handle archive attribute using attrib
 	if attrs&WinAttrArchive != 0 {
 		if err := exec.Command("attrib", "+a", path).Run(); err != nil {
+			mu.Lock() // Reacquire lock
 			return fmt.Errorf("%w: failed to set archive attribute", errors.ErrFilePermissionError)
 		}
 	} else {
 		if err := exec.Command("attrib", "-a", path).Run(); err != nil {
+			mu.Lock() // Reacquire lock
 			return fmt.Errorf("%w: failed to clear archive attribute", errors.ErrFilePermissionError)
 		}
 	}
 
+	mu.Lock() // Reacquire lock
 	return nil
 }
 
 // IsHidden checks if a file is hidden
 func IsHidden(path string) (bool, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if osutil.IsWindows() {
+		// Release lock for external command
+		mu.Unlock()
+
 		// On Windows, use attrib command to check if hidden
 		cmd := exec.Command("attrib", path)
 		output, err := cmd.Output()
+
+		mu.Lock() // Reacquire lock
+
 		if err != nil {
 			return false, fmt.Errorf("%w: failed to get file attributes", errors.ErrPathNotAccessible)
 		}
@@ -696,6 +819,10 @@ func IsHidden(path string) (bool, error) {
 
 // MakeHidden makes a file hidden
 func MakeHidden(path string) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Check if file exists
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
@@ -705,8 +832,14 @@ func MakeHidden(path string) error {
 	}
 
 	if osutil.IsWindows() {
+		// Release lock for external command
+		mu.Unlock()
+
 		// On Windows, use attrib command to set hidden attribute
 		err := exec.Command("attrib", "+h", path).Run()
+
+		mu.Lock() // Reacquire lock
+
 		if err != nil {
 			return fmt.Errorf("%w: failed to set hidden attribute", errors.ErrFilePermissionError)
 		}
@@ -719,6 +852,12 @@ func MakeHidden(path string) error {
 
 	if !strings.HasPrefix(base, ".") {
 		newPath := filepath.Join(dir, "."+base)
+
+		// Need to lock the new path as well for rename
+		newMu := GetPathMutex(newPath)
+		newMu.Lock()
+		defer newMu.Unlock()
+
 		if err := os.Rename(path, newPath); err != nil {
 			return fmt.Errorf("%w: failed to rename file", errors.ErrFilePermissionError)
 		}

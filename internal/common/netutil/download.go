@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/deploymenttheory/go-app-composer/internal/common/errors"
+	"github.com/deploymenttheory/go-app-composer/internal/common/fsutil"
 	logger "github.com/deploymenttheory/go-app-composer/internal/common/zap_logger"
 )
 
@@ -20,6 +21,7 @@ func DownloadFile(url, dest string, expectedChecksum string) error {
 		Timeout: 30 * time.Second,
 	}
 
+	// Network operations are inherently thread-safe
 	resp, err := client.Get(url)
 	if err != nil {
 		logger.LogError("Failed to initiate download", err, nil)
@@ -31,6 +33,11 @@ func DownloadFile(url, dest string, expectedChecksum string) error {
 		logger.LogError(fmt.Sprintf("Download failed with HTTP status: %d", resp.StatusCode), nil, nil)
 		return fmt.Errorf("%w: HTTP status %d", errors.ErrDownloadFailed, resp.StatusCode)
 	}
+
+	// Lock the destination path using our path-specific mutex system
+	mu := fsutil.GetPathMutex(dest)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Create the destination file
 	out, err := os.Create(dest)

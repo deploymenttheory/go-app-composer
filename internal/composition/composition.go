@@ -14,25 +14,6 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Step represents a single step in the composition workflow
-type Step struct {
-	Name        string                 `mapstructure:"name"`
-	Type        string                 `mapstructure:"type"`
-	Description string                 `mapstructure:"description"`
-	Condition   string                 `mapstructure:"condition"`
-	Parameters  map[string]interface{} `mapstructure:",remain"`
-}
-
-// Workflow represents the entire composition workflow
-type Workflow struct {
-	Name        string                 `mapstructure:"name"`
-	Description string                 `mapstructure:"description"`
-	Version     string                 `mapstructure:"version"`
-	Author      string                 `mapstructure:"author"`
-	Steps       []Step                 `mapstructure:"steps"`
-	Variables   map[string]interface{} `mapstructure:"variables"`
-}
-
 // LoadWorkflow loads a composition workflow from a file
 func LoadWorkflow(filePath string) (*Workflow, error) {
 	// Create a new viper instance for the composition

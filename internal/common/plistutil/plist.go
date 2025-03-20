@@ -4,7 +4,6 @@ package plistutil
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
@@ -38,30 +37,26 @@ type PlistInfo struct {
 
 // ReadPlist reads a property list file and returns its contents as a map
 func ReadPlist(path string) (map[string]interface{}, error) {
-	// Check if file exists
-	if !fsutil.FileExists(path) {
-		return nil, fmt.Errorf("%w: %s", errors.ErrFileNotFound, path)
-	}
-
-	// Open the file
-	file, err := os.Open(path)
+	data, err := fsutil.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: %s", errors.ErrFileNotFound, path)
+		}
 		if os.IsPermission(err) {
 			return nil, fmt.Errorf("%w: %s", errors.ErrPermissionDenied, path)
 		}
 		return nil, fmt.Errorf("%w: %s", errors.ErrPathNotAccessible, path)
 	}
-	defer file.Close()
 
-	// Read the plist
-	var data map[string]interface{}
-	decoder := plist.NewDecoder(file)
-	err = decoder.Decode(&data)
+	// Decode the plist data
+	var result map[string]interface{}
+	decoder := plist.NewDecoder(bytes.NewReader(data))
+	err = decoder.Decode(&result)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", errors.ErrUnsupportedFile, err.Error())
 	}
 
-	return data, nil
+	return result, nil
 }
 
 // WritePlist writes data to a property list file in the specified format
@@ -109,26 +104,16 @@ func WritePlist(path string, data map[string]interface{}, format Format) error {
 
 // DetectFormat detects the format of a plist file
 func DetectFormat(path string) (Format, error) {
-	// Check if file exists
-	if !fsutil.FileExists(path) {
-		return FormatXML, fmt.Errorf("%w: %s", errors.ErrFileNotFound, path)
-	}
-
-	// Open the file
-	file, err := os.Open(path)
+	// Use our new ReadFileHeader function to get the first 8 bytes
+	header, err := fsutil.ReadFileHeader(path, 8)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return FormatXML, fmt.Errorf("%w: %s", errors.ErrFileNotFound, path)
+		}
 		if os.IsPermission(err) {
 			return FormatXML, fmt.Errorf("%w: %s", errors.ErrPermissionDenied, path)
 		}
 		return FormatXML, fmt.Errorf("%w: %s", errors.ErrPathNotAccessible, path)
-	}
-	defer file.Close()
-
-	// Read the first few bytes to determine format
-	header := make([]byte, 8)
-	_, err = file.Read(header)
-	if err != nil && err != io.EOF {
-		return FormatXML, fmt.Errorf("%w: failed to read file header", errors.ErrUnsupportedFile)
 	}
 
 	// Check for XML

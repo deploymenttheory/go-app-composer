@@ -317,6 +317,12 @@ func GetRuntimeDir(appName string) (string, error) {
 func GetTempCompressionDir() (string, error) {
 	tempDir := os.TempDir()
 	compressionDir := filepath.Join(tempDir, "app_composer_compression")
+
+	// Use mutex to protect directory creation
+	mu := GetPathMutex(compressionDir)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if err := os.MkdirAll(compressionDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create temp compression directory: %w", err)
 	}

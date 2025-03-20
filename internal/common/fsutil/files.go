@@ -27,6 +27,10 @@ type FileInfo struct {
 
 // FileExists checks if a file exists and is not a directory
 func FileExists(path string) bool {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return false
@@ -36,6 +40,10 @@ func FileExists(path string) bool {
 
 // GetFileInfo retrieves file information
 func GetFileInfo(path string) (*FileInfo, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("error getting file info: %w", err)
@@ -52,6 +60,10 @@ func GetFileInfo(path string) (*FileInfo, error) {
 
 // ReadFile reads an entire file into memory
 func ReadFile(path string) ([]byte, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	return os.ReadFile(path)
 }
 
@@ -66,8 +78,16 @@ func ReadFileString(path string) (string, error) {
 
 // WriteFile writes data to a file, creating it if necessary
 func WriteFile(path string, data []byte, perm os.FileMode) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Ensure directory exists
 	dir := filepath.Dir(path)
+	dirMu := GetPathMutex(dir)
+	dirMu.Lock()
+	defer dirMu.Unlock()
+
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -82,6 +102,10 @@ func WriteFileString(path string, content string, perm os.FileMode) error {
 
 // AppendToFile appends data to an existing file
 func AppendToFile(path string, data []byte) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -99,6 +123,10 @@ func AppendStringToFile(path string, content string) error {
 
 // CopyFile copies a file from source to destination
 func CopyFile(src, dst string) error {
+	// Lock both source and destination to prevent concurrent modifications
+	unlock := acquireMutexes(src, dst)
+	defer unlock()
+
 	// Open source file
 	sourceFile, err := os.Open(src)
 	if err != nil {
@@ -113,7 +141,8 @@ func CopyFile(src, dst string) error {
 	}
 
 	// Create destination directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+	destDir := filepath.Dir(dst)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return fmt.Errorf("error creating destination directory: %w", err)
 	}
 
@@ -139,29 +168,46 @@ func CopyFile(src, dst string) error {
 
 // MoveFile moves a file from source to destination
 func MoveFile(src, dst string) error {
+	// Lock both source and destination
+	unlock := acquireMutexes(src, dst)
+	defer unlock()
+
 	// First try the atomic rename operation
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
 
-	// If rename fails (e.g., cross-device), fall back to copy and delete
+	// If rename fails (e.g., cross-device), release locks to avoid deadlocks
+	unlock()
+
+	// Fall back to copy and delete
 	if err := CopyFile(src, dst); err != nil {
 		return err
 	}
 
-	return os.Remove(src)
+	return DeleteFile(src)
 }
 
 // DeleteFile deletes a file if it exists
 func DeleteFile(path string) error {
-	if !FileExists(path) {
-		return nil // File doesn't exist, nothing to do
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check if file exists under lock
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return nil // File doesn't exist or is a directory, nothing to do
 	}
 	return os.Remove(path)
 }
 
 // ReadLines reads a file line by line and returns an array of strings
 func ReadLines(path string) ([]string, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -183,6 +229,10 @@ func ReadLines(path string) ([]string, error) {
 
 // ReadFileChunked reads a file in chunks, calling the provided function for each chunk
 func ReadFileChunked(path string, chunkSize int, processChunk func([]byte) error) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -199,6 +249,9 @@ func ReadFileChunked(path string, chunkSize int, processChunk func([]byte) error
 			return err
 		}
 
+		// Process the chunk while holding the lock
+		// If the processing function is long-running, consider releasing the lock
+		// and reacquiring it after processing each chunk
 		if err := processChunk(buffer[:bytesRead]); err != nil {
 			return err
 		}
@@ -209,6 +262,10 @@ func ReadFileChunked(path string, chunkSize int, processChunk func([]byte) error
 
 // GetFileHash calculates a file's hash using the specified algorithm
 func GetFileHash(path string, hashType string) (string, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -248,8 +305,13 @@ func GetFileHash(path string, hashType string) (string, error) {
 
 // TouchFile updates a file's access and modification times, creating it if it doesn't exist
 func TouchFile(path string) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Check if file exists
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	_, err := os.Stat(path)
+	if os.IsNotExist(err) {
 		// Create an empty file
 		file, err := os.Create(path)
 		if err != nil {
@@ -267,6 +329,10 @@ func TouchFile(path string) error {
 
 // IsFileExecutable checks if a file is executable
 func IsFileExecutable(path string) bool {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return false
@@ -278,6 +344,10 @@ func IsFileExecutable(path string) bool {
 
 // SetFileExecutable sets or removes the executable bit on a file
 func SetFileExecutable(path string, executable bool) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -295,6 +365,10 @@ func SetFileExecutable(path string, executable bool) error {
 
 // IsFileEmpty checks if a file is empty (size of 0 bytes)
 func IsFileEmpty(path string) (bool, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return false, err
@@ -305,6 +379,10 @@ func IsFileEmpty(path string) (bool, error) {
 
 // IsFileBinary makes a best-effort determination of whether a file is binary or text
 func IsFileBinary(path string) (bool, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Read a small chunk of the file to analyze
 	file, err := os.Open(path)
 	if err != nil {
@@ -327,4 +405,78 @@ func IsFileBinary(path string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// ReadFileHeader reads the first n bytes of a file
+func ReadFileHeader(path string, n int) ([]byte, error) {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	buffer := make([]byte, n)
+	bytesRead, err := file.Read(buffer)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	return buffer[:bytesRead], nil
+}
+
+// ReadFileChunkedWithLimit reads a file in chunks, stopping after maxBytes or EOF
+func ReadFileChunkedWithLimit(path string, chunkSize int, maxBytes int64, processChunk func([]byte, int64) error) error {
+	mu := GetPathMutex(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	buffer := make([]byte, chunkSize)
+	var totalBytesRead int64 = 0
+
+	for {
+		// Check if we've read enough already
+		if maxBytes > 0 && totalBytesRead >= maxBytes {
+			break
+		}
+
+		// Calculate remaining bytes to read
+		remainingBytes := chunkSize
+		if maxBytes > 0 {
+			remainingToLimit := maxBytes - totalBytesRead
+			if int64(remainingBytes) > remainingToLimit {
+				remainingBytes = int(remainingToLimit)
+			}
+		}
+
+		// Read the next chunk
+		bytesRead, err := file.Read(buffer[:remainingBytes])
+		if bytesRead > 0 {
+			totalBytesRead += int64(bytesRead)
+
+			// Process this chunk
+			if err := processChunk(buffer[:bytesRead], totalBytesRead); err != nil {
+				return err
+			}
+		}
+
+		// Handle EOF or other errors
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+	}
+
+	return nil
 }

@@ -1,16 +1,44 @@
 package jsonutil
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/deploymenttheory/go-app-composer/internal/common/errors"
 	"github.com/deploymenttheory/go-app-composer/internal/common/fsutil"
 )
 
-// ReadJSONFile reads a JSON file and unmarshals its contents into a map
-func ReadJSONFile(path string) (map[string]interface{}, error) {
+// JSONFormat represents the formatting style for JSON files
+type JSONFormat int
+
+const (
+	// FormatStandard uses standard JSON formatting
+	FormatStandard JSONFormat = iota
+	// FormatIndented uses indented JSON with 2-space indentation
+	FormatIndented
+	// FormatMinified removes all whitespace
+	FormatMinified
+)
+
+// JSONOptions provides configuration for JSON operations
+type JSONOptions struct {
+	Format       JSONFormat
+	IndentPrefix string
+	IndentSize   int
+}
+
+// DefaultJSONOptions provides default settings for JSON formatting
+var DefaultJSONOptions = JSONOptions{
+	Format:       FormatIndented,
+	IndentPrefix: "",
+	IndentSize:   2,
+}
+
+// ReadJSON reads a JSON file and unmarshals its contents into a map
+func ReadJSON(path string) (map[string]interface{}, error) {
 	if !fsutil.FileExists(path) {
 		return nil, fmt.Errorf("%w: %s", errors.ErrFileNotFound, path)
 	}
@@ -21,20 +49,40 @@ func ReadJSONFile(path string) (map[string]interface{}, error) {
 	}
 
 	var result map[string]interface{}
-	if err := json.Unmarshal(data, &result); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber() // Preserve numeric precision
+	if err := decoder.Decode(&result); err != nil {
 		return nil, fmt.Errorf("%w: %s", errors.ErrUnsupportedFile, err.Error())
 	}
 
 	return result, nil
 }
 
-// WriteJSONFile writes a map to a JSON file with indentation
-func WriteJSONFile(path string, data map[string]interface{}) error {
+// WriteJSON writes a map to a JSON file with specified formatting
+func WriteJSON(path string, data map[string]interface{}, options ...JSONOptions) error {
 	if !fsutil.DirExists(fsutil.GetDir(path)) {
 		return fmt.Errorf("%w: %s", errors.ErrDirNotFound, path)
 	}
 
-	jsonData, err := json.MarshalIndent(data, "", "  ")
+	// Use default options if not provided
+	opts := DefaultJSONOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+
+	var jsonData []byte
+	var err error
+
+	switch opts.Format {
+	case FormatIndented:
+		jsonData, err = json.MarshalIndent(data, opts.IndentPrefix, strings.Repeat(" ", opts.IndentSize))
+	case FormatMinified:
+		jsonData, err = json.Marshal(data)
+	default:
+		// Standard formatting
+		jsonData, err = json.MarshalIndent(data, "", "  ")
+	}
+
 	if err != nil {
 		return fmt.Errorf("%w: %s", errors.ErrFileWriteError, err.Error())
 	}
@@ -126,4 +174,58 @@ func MergeJSON(base, overlay map[string]interface{}) map[string]interface{} {
 	}
 
 	return result
+}
+
+// Validate checks if a file contains valid JSON
+func Validate(path string) error {
+	// Open the file
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("%w: %s", errors.ErrFileNotFound, err.Error())
+	}
+	defer file.Close()
+
+	// Create a JSON decoder
+	decoder := json.NewDecoder(file)
+	decoder.UseNumber() // Preserve numeric precision
+
+	// Try to read the first token
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("%w: invalid JSON", errors.ErrUnsupportedFile)
+	}
+
+	// Ensure no additional tokens remain
+	if decoder.More() {
+		return fmt.Errorf("%w: multiple JSON objects", errors.ErrUnsupportedFile)
+	}
+
+	return nil
+}
+
+// PrettyPrint converts a map to a formatted JSON string
+func PrettyPrint(data map[string]interface{}) (string, error) {
+	jsonData, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", errors.ErrFileWriteError, err.Error())
+	}
+	return string(jsonData), nil
+}
+
+// Clone creates a deep copy of a JSON map
+func Clone(data map[string]interface{}) (map[string]interface{}, error) {
+	// Marshal the original map to JSON
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", errors.ErrFileWriteError, err.Error())
+	}
+
+	// Unmarshal back into a new map
+	var clonedData map[string]interface{}
+	decoder := json.NewDecoder(bytes.NewReader(jsonData))
+	decoder.UseNumber() // Preserve numeric precision
+	if err := decoder.Decode(&clonedData); err != nil {
+		return nil, fmt.Errorf("%w: %s", errors.ErrUnsupportedFile, err.Error())
+	}
+
+	return clonedData, nil
 }
