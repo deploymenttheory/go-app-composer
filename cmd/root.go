@@ -86,6 +86,18 @@ func init() {
 	// Storage provider flag
 	rootCmd.PersistentFlags().String("storage-provider", config.Instance.Storage.Provider, "Storage provider to use")
 
+	// VirusTotal flags
+	rootCmd.PersistentFlags().String("vt-api-key", "", "VirusTotal API key")
+	rootCmd.PersistentFlags().String("vt-cache-mode", "memory", "VirusTotal cache mode: memory, file, or none")
+	rootCmd.PersistentFlags().String("vt-cache-path", "", "Path for VirusTotal cache files when using file cache mode")
+	rootCmd.PersistentFlags().Bool("vt-wait-completion", false, "Wait for VirusTotal scan completion")
+
+	// Bind VirusTotal flags to viper settings
+	viper.BindPFlag("vtutil.api_key", rootCmd.PersistentFlags().Lookup("vt-api-key"))
+	viper.BindPFlag("vtutil.cache_mode", rootCmd.PersistentFlags().Lookup("vt-cache-mode"))
+	viper.BindPFlag("vtutil.cache_path", rootCmd.PersistentFlags().Lookup("vt-cache-path"))
+	viper.BindPFlag("vtutil.wait_completion", rootCmd.PersistentFlags().Lookup("vt-wait-completion"))
+
 	// Bind flags to viper settings
 	viper.BindPFlag("debug", rootCmd.PersistentFlags().Lookup("debug"))
 	viper.BindPFlag("log_format", rootCmd.PersistentFlags().Lookup("log-format"))

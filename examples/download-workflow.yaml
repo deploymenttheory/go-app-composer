@@ -1,0 +1,67 @@
+# Security-Aware Download Workflow
+name: "Security-Aware Software Download"
+description: "Downloads software and scans it with VirusTotal before extraction"
+version: "1.0"
+author: "Your Name"
+
+# Variables that can be referenced in steps
+variables:
+  vt_api_key: "YOUR_VIRUSTOTAL_API_KEY"  # Replace with your actual API key
+  safety_threshold: "Low"  # Set your threshold: Clean, Low, Medium, High
+
+steps:
+  - name: "Download Software"
+    type: download
+    description: "Download the target software package"
+    parameters:
+      url: "https://example.com/software.zip"  # Replace with actual URL
+      output: "{{ cache_dir }}/downloads/software.zip"
+      verify_checksum: "false"  # Enable if you have a checksum
+
+  - name: "Source URL Security Check"
+    type: scan
+    description: "Check the download URL for security issues"
+    parameters:
+      input: "https://example.com"  # Replace with actual download domain
+      scan_type: "url"
+      wait_for_completion: "true"
+
+  - name: "Domain Reputation Check"
+    type: scan
+    description: "Check the reputation of the download domain"
+    parameters:
+      input: "example.com"  # Replace with actual domain
+      scan_type: "domain"
+      include_subdomains: "true"
+      include_whois: "true"
+
+  - name: "Scan Downloaded File"
+    type: scan
+    description: "Check the downloaded file with VirusTotal"
+    parameters:
+      input: "{{ downloaded_file }}"
+      scan_type: "file"
+      wait_for_completion: "true"
+
+  - name: "Extract If Safe"
+    type: extract
+    description: "Extract the file if VirusTotal scan shows it's safe"
+    condition: "{{ vt_threat_level == 'Clean' || vt_threat_level == 'Low' }}"
+    parameters:
+      source: "{{ downloaded_file }}"
+      destination: "{{ temp_dir }}/extracted"
+      format: "auto"  # Auto-detect archive format
+
+  - name: "Security Report"
+    type: script
+    description: "Generate a security report for the downloaded content"
+    parameters:
+      script: |
+        echo "Security Report for {{ downloaded_file }}" > {{ temp_dir }}/security_report.txt
+        echo "Download URL: {{ step.Download Software.parameters.url }}" >> {{ temp_dir }}/security_report.txt
+        echo "File Size: {{ file_size_bytes }} bytes" >> {{ temp_dir }}/security_report.txt
+        echo "VirusTotal Threat Level: {{ vt_threat_level }}" >> {{ temp_dir }}/security_report.txt
+        echo "VirusTotal Threat Name: {{ vt_threat_name }}" >> {{ temp_dir }}/security_report.txt
+        echo "VirusTotal Report URL: {{ vt_permalink }}" >> {{ temp_dir }}/security_report.txt
+        echo "Scan Date: {{ vt_scan_date }}" >> {{ temp_dir }}/security_report.txt
+        echo "Extraction Status: {{ (vt_threat_level == 'Clean' || vt_threat_level == 'Low') ? 'Extracted' : 'Blocked due to security concerns' }}" >> {{ temp_dir }}/security_report.txt

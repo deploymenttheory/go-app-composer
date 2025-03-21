@@ -313,7 +313,7 @@ func handleScanStep(step Step, variables map[string]interface{}) (map[string]int
 		}
 	}
 
-	// Get API key (required)
+	// Get API key (first from step parameters, then from workflow variables)
 	apiKey, ok := step.Parameters["api_key"].(string)
 	if !ok {
 		// Try to get from variables
@@ -347,7 +347,11 @@ func handleScanStep(step Step, variables map[string]interface{}) (map[string]int
 			if cachePath, ok := step.Parameters["cache_path"].(string); ok {
 				config.CachePath = cachePath
 			} else {
-				config.CachePath = filepath.Join(variables["cache_dir"].(string), "vt-cache")
+				cacheDir, ok := variables["cache_dir"].(string)
+				if !ok {
+					cacheDir = "cache"
+				}
+				config.CachePath = filepath.Join(cacheDir, "vt-cache")
 			}
 		}
 
