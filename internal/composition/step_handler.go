@@ -2,6 +2,7 @@ package composition
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
 	"github.com/deploymenttheory/go-app-composer/internal/utils/plistutil"
 	"github.com/deploymenttheory/go-app-composer/internal/utils/urlutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/vtutil"
 )
 
 // StepHandler is a function that executes a workflow step
@@ -245,11 +247,6 @@ func handleAddFileStep(step Step, variables map[string]interface{}) (map[string]
 	return nil, fmt.Errorf("add_file step not yet implemented")
 }
 
-func handleScanStep(step Step, variables map[string]interface{}) (map[string]interface{}, error) {
-	// TODO: Implement virus scan functionality
-	return nil, fmt.Errorf("scan step not yet implemented")
-}
-
 func handleSignStep(step Step, variables map[string]interface{}) (map[string]interface{}, error) {
 	// TODO: Implement code signing functionality
 	return nil, fmt.Errorf("sign step not yet implemented")
@@ -288,6 +285,184 @@ func handleExecStep(step Step, variables map[string]interface{}) (map[string]int
 func handleScriptStep(step Step, variables map[string]interface{}) (map[string]interface{}, error) {
 	// TODO: Implement script functionality
 	return nil, fmt.Errorf("script step not yet implemented")
+}
+
+// ---- vt scan steps ---- //
+
+// handleScanStep implements virus scanning functionality using VirusTotal
+func handleScanStep(step Step, variables map[string]interface{}) (map[string]interface{}, error) {
+	// Validate required parameters
+	input, ok := step.Parameters["input"].(string)
+	if !ok {
+		logger.LogError("scan step requires an input parameter", nil, nil)
+		return nil, fmt.Errorf("%w: missing input parameter", errors.ErrInvalidArgument)
+	}
+
+	// Determine the scan type
+	scanType, _ := step.Parameters["scan_type"].(string)
+	if scanType == "" {
+		// Auto-detect based on input format
+		if fsutil.FileExists(input) {
+			scanType = "file"
+		} else if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+			scanType = "url"
+		} else if net.ParseIP(input) != nil {
+			scanType = "ip"
+		} else {
+			scanType = "domain"
+		}
+	}
+
+	// Get API key (required)
+	apiKey, ok := step.Parameters["api_key"].(string)
+	if !ok {
+		// Try to get from variables
+		if apiKeyVar, ok := variables["vt_api_key"].(string); ok {
+			apiKey = apiKeyVar
+		} else {
+			logger.LogError("scan step requires an API key for VirusTotal", nil, nil)
+			return nil, fmt.Errorf("%w: missing VirusTotal API key", errors.ErrInvalidArgument)
+		}
+	}
+
+	// Initialize VirusTotal client if not already initialized
+	if !vtutil.IsInitialized() {
+		config := vtutil.DefaultConfig()
+		config.APIKey = apiKey
+
+		// Configure cache settings
+		cacheMode := vtutil.CacheModeMemory
+		if cacheStr, ok := step.Parameters["cache_mode"].(string); ok {
+			switch strings.ToLower(cacheStr) {
+			case "none":
+				cacheMode = vtutil.CacheModeNone
+			case "file":
+				cacheMode = vtutil.CacheModeFile
+			}
+		}
+		config.CacheMode = cacheMode
+
+		// Set cache path if in file mode
+		if config.CacheMode == vtutil.CacheModeFile {
+			if cachePath, ok := step.Parameters["cache_path"].(string); ok {
+				config.CachePath = cachePath
+			} else {
+				config.CachePath = filepath.Join(variables["cache_dir"].(string), "vt-cache")
+			}
+		}
+
+		// Initialize VT utilities
+		if err := vtutil.Configure(config); err != nil {
+			logger.LogError("Failed to initialize VirusTotal client", err, nil)
+			return nil, fmt.Errorf("failed to initialize VirusTotal client: %w", err)
+		}
+	}
+
+	// Generate results based on scan type
+	var result vtutil.ScanResult
+
+	logger.LogInfo(fmt.Sprintf("Starting VirusTotal scan of %s (%s)", input, scanType), nil)
+
+	switch scanType {
+	case "file":
+		// Check if input exists
+		if !fsutil.FileExists(input) {
+			return nil, fmt.Errorf("%w: file not found: %s", errors.ErrFileNotFound, input)
+		}
+
+		// Configure scan options
+		waitForCompletion := false
+		if waitStr, ok := step.Parameters["wait_for_completion"].(string); ok {
+			waitForCompletion = strings.ToLower(waitStr) == "true"
+		}
+
+		// Scan the file
+		fileResult, err := vtutil.ScanFile(input,
+			vtutil.WithWaitForCompletion(waitForCompletion),
+		)
+		if err != nil {
+			logger.LogError(fmt.Sprintf("Failed to scan file: %s", input), err, nil)
+			return nil, fmt.Errorf("failed to scan file: %w", err)
+		}
+		result = fileResult
+
+	case "url":
+		// Configure scan options
+		waitForCompletion := false
+		if waitStr, ok := step.Parameters["wait_for_completion"].(string); ok {
+			waitForCompletion = strings.ToLower(waitStr) == "true"
+		}
+
+		// Scan the URL
+		urlResult, err := vtutil.ScanURL(input,
+			vtutil.WithURLWaitForCompletion(waitForCompletion),
+		)
+		if err != nil {
+			logger.LogError(fmt.Sprintf("Failed to scan URL: %s", input), err, nil)
+			return nil, fmt.Errorf("failed to scan URL: %w", err)
+		}
+		result = urlResult
+
+	case "domain":
+		// Check for options
+		includeSubdomains := true
+		if subStr, ok := step.Parameters["include_subdomains"].(string); ok {
+			includeSubdomains = strings.ToLower(subStr) != "false"
+		}
+
+		includeWhois := true
+		if whoisStr, ok := step.Parameters["include_whois"].(string); ok {
+			includeWhois = strings.ToLower(whoisStr) != "false"
+		}
+
+		// Scan the domain
+		domainResult, err := vtutil.LookupDomain(input,
+			vtutil.WithDomainSubdomains(includeSubdomains),
+			vtutil.WithDomainWhois(includeWhois),
+		)
+		if err != nil {
+			logger.LogError(fmt.Sprintf("Failed to scan domain: %s", input), err, nil)
+			return nil, fmt.Errorf("failed to scan domain: %w", err)
+		}
+		result = domainResult
+
+	case "ip":
+		// Check for options
+		includeResolutions := true
+		if resStr, ok := step.Parameters["include_resolutions"].(string); ok {
+			includeResolutions = strings.ToLower(resStr) != "false"
+		}
+
+		// Scan the IP
+		ipResult, err := vtutil.LookupIP(input,
+			vtutil.WithIPResolutions(includeResolutions),
+		)
+		if err != nil {
+			logger.LogError(fmt.Sprintf("Failed to scan IP: %s", input), err, nil)
+			return nil, fmt.Errorf("failed to scan IP: %w", err)
+		}
+		result = ipResult
+
+	default:
+		return nil, fmt.Errorf("%w: unsupported scan type: %s", errors.ErrInvalidScanType, scanType)
+	}
+
+	// Create a standardized summary
+	summary := vtutil.GetScanResultSummary(result)
+	threatLevel := vtutil.ThreatLevelToString(summary.ThreatLevel)
+
+	logger.LogInfo(fmt.Sprintf("VirusTotal scan completed: %s is %s (Threat Level: %s)",
+		input, summary.ThreatName, threatLevel), nil)
+
+	// Return results for use in subsequent steps
+	return map[string]interface{}{
+		"vt_scan_result":  result,
+		"vt_threat_level": threatLevel,
+		"vt_threat_name":  summary.ThreatName,
+		"vt_permalink":    summary.Permalink,
+		"vt_scan_date":    summary.ScanDate.Format(time.RFC3339),
+		"vt_resource":     summary.Resource,
+	}, nil
 }
 
 // ---- compress / decompress steps ---- //

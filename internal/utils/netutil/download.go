@@ -8,9 +8,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/deploymenttheory/go-app-composer/internal/logger"
 	"github.com/deploymenttheory/go-app-composer/internal/utils/errors"
 	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
-	logger "github.com/deploymenttheory/go-app-composer/internal/utils/zap_logger"
 )
 
 // DownloadFile downloads a file from a URL and saves it to a local path.

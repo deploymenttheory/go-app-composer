@@ -48,8 +48,8 @@ var (
 	// Hash Errors
 	ErrInvalidHasher = errors.New("invalid hasher")
 
-	// Package Maanger Errors
-	rrPackageNotFound       = errors.New("package not found")
+	// Package Manager Errors
+	ErrPackageNotFound      = errors.New("package not found") // Fixed typo from 'rrPackageNotFound'
 	ErrPackageInstallFailed = errors.New("package installation failed")
 	ErrPackageRemoveFailed  = errors.New("package removal failed")
 	ErrPackageUpdateFailed  = errors.New("package update failed")
@@ -60,4 +60,39 @@ var (
 	ErrDependencyResolution = errors.New("failed to resolve dependencies")
 	ErrRepositoryNotFound   = errors.New("package repository not found")
 	ErrRepositoryUpdate     = errors.New("failed to update package repository")
+
+	// VirusTotal API Errors
+	ErrAPIKeyMissing           = errors.New("API key is required")
+	ErrAPIRateLimitExceeded    = errors.New("API rate limit exceeded")
+	ErrAPICommunicationError   = errors.New("error communicating with VirusTotal API")
+	ErrAPIAuthenticationFailed = errors.New("VirusTotal API authentication failed")
+	ErrAPIQuotaExceeded        = errors.New("VirusTotal API quota exceeded")
+
+	// Scanning Errors
+	ErrScanFailed           = errors.New("scan failed to complete")
+	ErrScanTimeout          = errors.New("scan timed out")
+	ErrScanNotFound         = errors.New("scan result not found")
+	ErrResourceNotFound     = errors.New("requested resource not found")
+	ErrInvalidScanType      = errors.New("invalid scan type")
+	ErrUploadError          = errors.New("error uploading file for scanning")
+	ErrTooLargeForScan      = errors.New("file too large for scanning")
+	ErrFileTypeNotSupported = errors.New("file type not supported for scanning")
+
+	// Network Errors
+	ErrNetworkError        = errors.New("network error")
+	ErrHostNotFound        = errors.New("host not found")
+	ErrConnectionRefused   = errors.New("connection refused")
+	ErrSSLCertificateError = errors.New("SSL certificate error")
+
+	// Cache Errors
+	ErrCacheFailure        = errors.New("cache operation failed")
+	ErrCacheCorrupted      = errors.New("cache data corrupted")
+	ErrCacheNotInitialized = errors.New("cache not initialized")
+
+	// Configuration Errors
+	ErrConfigInvalid      = errors.New("invalid configuration")
+	ErrConfigFileNotFound = errors.New("configuration file not found")
+	ErrConfigParseError   = errors.New("error parsing configuration")
+	ErrAlreadyInitialized = errors.New("component already initialized")
+	ErrNotInitialized     = errors.New("component not initialized")
 )
