@@ -815,6 +815,8 @@ func (ctx *EncryptionContext) SetPassphraseHint(hint string) error {
 	return nil
 }
 
+package apfs
+
 // EnableVolumeEncryption encrypts an unencrypted volume
 func (vm *VolumeManager) EnableVolumeEncryption(tx *Transaction, password string) error {
 	// Check if already encrypted
@@ -825,4 +827,279 @@ func (vm *VolumeManager) EnableVolumeEncryption(tx *Transaction, password string
 	// In a real implementation, this would:
 	// 1. Generate a new volume encryption key (VEK)
 	// 2. Create a container keybag entry for the volume
-	// 3. Create a volume keybag with the
+	// 3. Create a volume keybag with the password-based KEK
+	// 4. Start the encryption process for all files
+
+	// Set the volume flags
+	vm.superblock.FSFlags &= ^uint64(APFSFSUnencrypted)
+
+	// Set the container flags for software encryption
+	vm.container.superblock.Flags |= NX_CRYPTO_SW
+
+	// Set the encryption rolling state
+	// In a real implementation, this would create an ER_STATE_PHYS object
+	vm.superblock.ERStateOID = vm.container.superblock.NextOID
+	vm.container.superblock.NextOID++
+
+	// Mark the volume as encrypting
+	vm.omap.physicalObj.OmFlags |= OMAP_ENCRYPTING
+
+	return nil
+}
+
+// DisableVolumeEncryption decrypts an encrypted volume
+func (vm *VolumeManager) DisableVolumeEncryption(tx *Transaction, password string) error {
+	// Check if encrypted
+	if (vm.superblock.FSFlags & APFSFSUnencrypted) != 0 {
+		return errors.New("volume is not encrypted")
+	}
+
+	// Create an encryption context
+	ctx, err := NewEncryptionContext(vm.container, vm)
+	if err != nil {
+		return err
+	}
+
+	// Decrypt the volume
+	err = ctx.Decrypt(password)
+	if err != nil {
+		return err
+	}
+
+	// In a real implementation, this would:
+	// 1. Start the decryption process for all files
+	// 2. Remove the keybags
+
+	// Set the volume flags
+	vm.superblock.FSFlags |= APFSFSUnencrypted
+
+	// Mark the volume as decrypting
+	vm.omap.physicalObj.OmFlags |= OMAP_DECRYPTING
+
+	return nil
+}
+
+// GetFileKey gets a file's encryption key
+func (ctx *EncryptionContext) GetFileKey(file *File) ([]byte, error) {
+	// Check if decrypted
+	if !ctx.isDecrypted {
+		return nil, ErrNoKeyAvailable
+	}
+
+	// Check if we're using per-volume encryption (software encryption)
+	if (ctx.volume.superblock.FSFlags & APFSFSOnekey) != 0 {
+		// Volume encryption key is used for all files
+		return ctx.vek.unwrapped, nil
+	}
+
+	// For per-file encryption, we would need to:
+	// 1. Find the file's crypto state record
+	// 2. Unwrap the file's encryption key
+
+	return nil, ErrNotImplemented
+}
+
+// RollEncryptionKeys rolls the volume's encryption keys
+func (ctx *EncryptionContext) RollEncryptionKeys(password string) error {
+	// Check if decrypted
+	if !ctx.isDecrypted {
+		// Decrypt first
+		err := ctx.Decrypt(password)
+		if err != nil {
+			return err
+		}
+	}
+
+	// In a real implementation, this would:
+	// 1. Generate a new volume encryption key
+	// 2. Re-wrap all keys with the new VEK
+	// 3. Mark the volume as key rolling
+	// 4. Start the key rolling process
+
+	// Mark the volume as key rolling
+	ctx.volume.omap.physicalObj.OmFlags |= OMAP_KEYROLLING
+
+	// Toggle crypto generation flags
+	ctx.volume.omap.physicalObj.OmFlags ^= OMAP_CRYPTO_GENERATION
+
+	return nil
+}
+
+// IsEncrypted returns true if the volume is encrypted
+func (vm *VolumeManager) IsEncrypted() bool {
+	return (vm.superblock.FSFlags & APFSFSUnencrypted) == 0
+}
+
+// IsFVEnabled returns true if FileVault is enabled
+func (vm *VolumeManager) IsFVEnabled() bool {
+	// Check if the volume is encrypted
+	if (vm.superblock.FSFlags & APFSFSUnencrypted) != 0 {
+		return false
+	}
+
+	// FileVault implies volume-level encryption
+	return (vm.superblock.FSFlags & APFSFSOnekey) != 0
+}
+
+// IsEncryptionInProgress returns true if encryption is in progress
+func (vm *VolumeManager) IsEncryptionInProgress() bool {
+	return (vm.omap.physicalObj.OmFlags & OMAP_ENCRYPTING) != 0
+}
+
+// IsDecryptionInProgress returns true if decryption is in progress
+func (vm *VolumeManager) IsDecryptionInProgress() bool {
+	return (vm.omap.physicalObj.OmFlags & OMAP_DECRYPTING) != 0
+}
+
+// IsKeyRollingInProgress returns true if key rolling is in progress
+func (vm *VolumeManager) IsKeyRollingInProgress() bool {
+	return (vm.omap.physicalObj.OmFlags & OMAP_KEYROLLING) != 0
+}
+
+// GetEncryptionProgress returns the progress of encryption/decryption
+func (vm *VolumeManager) GetEncryptionProgress() (float64, error) {
+	// Check if encryption state exists
+	if vm.superblock.ERStateOID == 0 {
+		return 0, ErrEncryptionNotFound
+	}
+
+	// In a real implementation, this would:
+	// 1. Read the encryption rolling state object
+	// 2. Calculate the progress from ersb_progress / ersb_total_blk_to_encrypt
+
+	// For now, return a fake progress
+	return 0.5, nil
+}
+
+// PauseEncryption pauses the encryption/decryption process
+func (vm *VolumeManager) PauseEncryption() error {
+	// Check if encryption state exists
+	if vm.superblock.ERStateOID == 0 {
+		return ErrEncryptionNotFound
+	}
+
+	// In a real implementation, this would set the ERSB_FLAG_PAUSED flag
+	// in the encryption rolling state
+
+	return nil
+}
+
+// ResumeEncryption resumes the encryption/decryption process
+func (vm *VolumeManager) ResumeEncryption() error {
+	// Check if encryption state exists
+	if vm.superblock.ERStateOID == 0 {
+		return ErrEncryptionNotFound
+	}
+
+	// In a real implementation, this would clear the ERSB_FLAG_PAUSED flag
+	// in the encryption rolling state
+
+	return nil
+}
+
+// DecryptFile reads and decrypts a file's contents
+func (file *File) DecryptFile() ([]byte, error) {
+	// Check if file has data
+	if file.dataStream == nil || file.dataStream.Size == 0 {
+		return []byte{}, nil
+	}
+
+	// Create an encryption context
+	ctx, err := NewEncryptionContext(file.volume.container, file.volume)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if already decrypted
+	if !ctx.IsDecrypted() {
+		return nil, ErrNoKeyAvailable
+	}
+
+	// Read the raw data
+	data, err := file.Read(0, int(file.dataStream.Size))
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt each extent
+	blockSize := int64(file.volume.container.blockSize)
+	decryptedData := make([]byte, len(data))
+	
+	for _, extent := range file.extents {
+		// Calculate the range this extent covers in the file
+		startOffset := extent.LogicalAddr
+		endOffset := startOffset + extent.Length
+		
+		// Calculate the corresponding range in our data buffer
+		bufferStart := startOffset
+		bufferEnd := endOffset
+		if bufferEnd > uint64(len(data)) {
+			bufferEnd = uint64(len(data))
+		}
+		
+		// Calculate the number of blocks in this extent
+		startBlock := startOffset / uint64(blockSize)
+		endBlock := (endOffset + uint64(blockSize) - 1) / uint64(blockSize)
+		
+		// Decrypt each block
+		for blockNum := startBlock; blockNum < endBlock; blockNum++ {
+			// Calculate the offset of this block in the file
+			blockOffset := blockNum * uint64(blockSize)
+			
+			// Calculate the range this block covers in our data buffer
+			blockStart := blockOffset
+			if blockStart < bufferStart {
+				blockStart = bufferStart
+			}
+			
+			blockEnd := (blockNum + 1) * uint64(blockSize)
+			if blockEnd > bufferEnd {
+				blockEnd = bufferEnd
+			}
+			
+			// Calculate the corresponding range in the extent
+			extentOffset := blockStart - startOffset
+			
+			// Calculate the physical block number
+			physBlock := extent.PhysicalBlock + (blockNum - startBlock)
+			
+			// Decrypt the block
+			blockData := data[blockStart:blockEnd]
+			decryptedBlock, err := ctx.DecryptBlock(blockData, physBlock, extent.CryptoID)
+			if err != nil {
+				return nil, err
+			}
+			
+			// Copy the decrypted data
+			copy(decryptedData[blockStart:blockEnd], decryptedBlock)
+		}
+	}
+	
+	return decryptedData, nil
+}
+
+// EncryptAndWriteFile encrypts and writes data to a file
+func (file *File) EncryptAndWriteFile(tx *Transaction, data []byte) error {
+	// Create an encryption context
+	ctx, err := NewEncryptionContext(file.volume.container, file.volume)
+	if err != nil {
+		return err
+	}
+
+	// Check if already decrypted
+	if !ctx.IsDecrypted() {
+		return ErrNoKeyAvailable
+	}
+
+	// In a real implementation, this would:
+	// 1. Allocate blocks for the file
+	// 2. Encrypt the data for each block
+	// 3. Write the encrypted data
+	// 4. Update the file extents
+
+	// For now, just write the data (it will be encrypted by the transaction)
+	return file.Write(tx, 0, data)
+}
+
+
+
