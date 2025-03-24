@@ -1,4 +1,5 @@
 // encryption.go
+
 package apfs
 
 import (
@@ -11,1095 +12,732 @@ import (
 	"fmt"
 )
 
-// Additional error definitions for encryption operations
-var (
-	ErrInvalidPassword     = errors.New("invalid password")
-	ErrEncryptionNotFound  = errors.New("encryption not found")
-	ErrWrongEncryptionType = errors.New("wrong encryption type")
-	ErrNoKeyAvailable      = errors.New("no encryption key available")
-	ErrKeyDerivationFailed = errors.New("key derivation failed")
-)
-
-// VolumeEncryptionKey represents a volume encryption key (VEK)
-type VolumeEncryptionKey struct {
-	wrapped   []byte
-	unwrapped []byte
-	type_     uint32
+// JCryptoKey represents the key half of a per-file encryption state record (j_crypto_key_t)
+type JCryptoKey struct {
+	Hdr JKey // The record's header
 }
 
-// KeyEncryptionKey represents a key encryption key (KEK)
-type KeyEncryptionKey struct {
-	wrapped   []byte
-	unwrapped []byte
-	type_     uint32
+// Serialize converts the crypto key to bytes
+func (key *JCryptoKey) Serialize() ([]byte, error) {
+	buf := &bytes.Buffer{}
+	err := binary.Write(buf, binary.LittleEndian, key.Hdr)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
-// EncryptionContext holds the necessary information for encryption/decryption
-type EncryptionContext struct {
-	vek              *VolumeEncryptionKey
-	passphrase       string
-	recoveryKey      string
-	container        *ContainerManager
-	volume           *VolumeManager
-	containerKeybag  *KBLocker
-	volumeKeybag     *KBLocker
-	isDecrypted      bool
-	useSoftwareXTS   bool
+// Parse parses a crypto key from bytes
+func (key *JCryptoKey) Parse(data []byte) error {
+	if len(data) < binary.Size(JKey{}) {
+		return ErrStructTooShort
+	}
+	return binary.Read(bytes.NewReader(data), binary.LittleEndian, &key.Hdr)
 }
 
-// NewEncryptionContext creates a new encryption context for a volume
-func NewEncryptionContext(container *ContainerManager, volume *VolumeManager) (*EncryptionContext, error) {
-	ctx := &EncryptionContext{
-		container: container,
-		volume:    volume,
-	}
-
-	// Check if the volume is encrypted
-	if (volume.superblock.FSFlags & APFSFSUnencrypted) != 0 {
-		// Volume is not encrypted
-		ctx.isDecrypted = true
-		return ctx, nil
-	}
-
-	// Check if we're using software encryption
-	ctx.useSoftwareXTS = (container.superblock.Flags & NX_CRYPTO_SW) != 0
-
-	// Load container keybag
-	if container.superblock.KeyLocker.Blocks > 0 {
-		keybagData, err := ctx.readKeybag(container.superblock.KeyLocker.Start, container.superblock.KeyLocker.Blocks)
-		if err != nil {
-			return nil, err
-		}
-
-		// Parse keybag
-		containerKeybag, err := ctx.parseKeybag(keybagData)
-		if err != nil {
-			return nil, err
-		}
-		ctx.containerKeybag = containerKeybag
-	} else {
-		return nil, ErrEncryptionNotFound
-	}
-
-	// Find volume keybag location from container keybag
-	volumeKeybagLocation, err := ctx.findVolumeKeybagLocation()
-	if err != nil {
-		return nil, err
-	}
-
-	// Load volume keybag
-	volumeKeybagData, err := ctx.readKeybag(volumeKeybagLocation.Start, volumeKeybagLocation.Blocks)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse volume keybag
-	volumeKeybag, err := ctx.parseKeybag(volumeKeybagData)
-	if err != nil {
-		return nil, err
-	}
-	ctx.volumeKeybag = volumeKeybag
-
-	return ctx, nil
+// JCryptoVal represents the value half of a per-file encryption state record (j_crypto_val_t)
+type JCryptoVal struct {
+	Refcnt uint32              // Reference count
+	State  WrappedCryptoState  // Encryption state
 }
 
-// readKeybag reads a keybag from disk
-func (ctx *EncryptionContext) readKeybag(start uint64, blocks uint64) ([]byte, error) {
-	// Calculate size and location
-	blockSize := int64(ctx.container.blockSize)
-	offset := int64(start) * blockSize
-	size := int64(blocks) * blockSize
-
-	// Read keybag data
-	data := make([]byte, size)
-	_, err := ctx.container.device.Seek(offset, 0)
+// Serialize converts the crypto value to bytes
+func (val *JCryptoVal) Serialize() ([]byte, error) {
+	buf := &bytes.Buffer{}
+	err := binary.Write(buf, binary.LittleEndian, val.Refcnt)
 	if err != nil {
 		return nil, err
 	}
-
-	_, err = ctx.container.device.Read(data)
-	if err != nil {
-		return nil, err
-	}
-
-	return data, nil
-}
-
-// parseKeybag parses keybag data
-func (ctx *EncryptionContext) parseKeybag(data []byte) (*KBLocker, error) {
-	// Unwrap keybag using container UUID or volume UUID
-	var uuid [16]byte
-	if ctx.volume != nil {
-		uuid = ctx.volume.superblock.VolUUID
-	} else {
-		uuid = ctx.container.superblock.UUID
-	}
-
-	// Unwrap keybag
-	unwrappedData, err := ctx.unwrapKeybag(data, uuid[:])
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse keybag structure
-	keybag := &KBLocker{}
-	err = binary.Read(bytes.NewReader(unwrappedData), binary.LittleEndian, &keybag.KlVersion)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check version
-	if keybag.KlVersion != APFSKeybagVersion {
-		return nil, fmt.Errorf("unsupported keybag version: %d", keybag.KlVersion)
-	}
-
-	// Read count and size
-	err = binary.Read(bytes.NewReader(unwrappedData[2:]), binary.LittleEndian, &keybag.KlNkeys)
-	if err != nil {
-		return nil, err
-	}
-
-	err = binary.Read(bytes.NewReader(unwrappedData[4:]), binary.LittleEndian, &keybag.KlNbytes)
-	if err != nil {
-		return nil, err
-	}
-
-	// Skip padding
-	entriesOffset := 16 // Size of KBLocker header
-
-	// The entries are stored after the header
-	keybag.KlEntries = make([]KeybagEntry, keybag.KlNkeys)
 	
-	// Track current position
-	pos := entriesOffset
+	stateBytes, err := val.State.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	
+	_, err = buf.Write(stateBytes)
+	if err != nil {
+		return nil, err
+	}
+	
+	return buf.Bytes(), nil
+}
 
-	// Read each entry
-	for i := uint16(0); i < keybag.KlNkeys; i++ {
-		entry := &keybag.KlEntries[i]
+// Parse parses a crypto value from bytes
+func (val *JCryptoVal) Parse(data []byte) error {
+	if len(data) < 4 {
+		return ErrStructTooShort
+	}
+	
+	val.Refcnt = binary.LittleEndian.Uint32(data[:4])
+	
+	if len(data) > 4 {
+		return val.State.Parse(data[4:])
+	}
+	
+	return nil
+}
+
+// WrappedCryptoState represents a wrapped key used for per-file encryption (wrapped_crypto_state_t)
+type WrappedCryptoState struct {
+	MajorVersion    uint16   // Major version for this structure's layout
+	MinorVersion    uint16   // Minor version for this structure's layout
+	Flags           uint32   // Crypto flags
+	PersistentClass uint32   // Protection class
+	KeyOSVersion    uint32   // OS version that created this structure
+	KeyRevision     uint16   // Key revision
+	KeyLen          uint16   // Size in bytes of the wrapped key data
+	PersistentKey   []byte   // Wrapped key data (variable length)
+}
+
+// Serialize converts the wrapped crypto state to bytes
+func (wcs *WrappedCryptoState) Serialize() ([]byte, error) {
+	size := 16 + len(wcs.PersistentKey) // Fixed fields + key
+	buf := make([]byte, size)
+	
+	binary.LittleEndian.PutUint16(buf[0:2], wcs.MajorVersion)
+	binary.LittleEndian.PutUint16(buf[2:4], wcs.MinorVersion)
+	binary.LittleEndian.PutUint32(buf[4:8], wcs.Flags)
+	binary.LittleEndian.PutUint32(buf[8:12], wcs.PersistentClass)
+	binary.LittleEndian.PutUint32(buf[12:16], wcs.KeyOSVersion)
+	
+	if len(wcs.PersistentKey) > 0 {
+		copy(buf[16:], wcs.PersistentKey)
+	}
+	
+	return buf, nil
+}
+
+// Parse parses a wrapped crypto state from bytes
+func (wcs *WrappedCryptoState) Parse(data []byte) error {
+	if len(data) < 16 {
+		return ErrStructTooShort
+	}
+	
+	wcs.MajorVersion = binary.LittleEndian.Uint16(data[0:2])
+	wcs.MinorVersion = binary.LittleEndian.Uint16(data[2:4])
+	wcs.Flags = binary.LittleEndian.Uint32(data[4:8])
+	wcs.PersistentClass = binary.LittleEndian.Uint32(data[8:12])
+	wcs.KeyOSVersion = binary.LittleEndian.Uint32(data[12:16])
+	
+	if len(data) > 16 {
+		wcs.KeyLen = uint16(len(data) - 16)
+		wcs.PersistentKey = make([]byte, wcs.KeyLen)
+		copy(wcs.PersistentKey, data[16:])
+	}
+	
+	return nil
+}
+
+// GetProtectionClass returns the protection class for this crypto state
+func (wcs *WrappedCryptoState) GetProtectionClass() uint32 {
+	return wcs.PersistentClass & CPEffectiveClassMask
+}
+
+// WrappedMetaCryptoState represents information about how the VEK is used 
+// to encrypt a file (wrapped_meta_crypto_state_t)
+type WrappedMetaCryptoState struct {
+	MajorVersion    uint16   // Major version for this structure's layout
+	MinorVersion    uint16   // Minor version for this structure's layout
+	Flags           uint32   // Crypto flags
+	PersistentClass uint32   // Protection class
+	KeyOSVersion    uint32   // OS version that created this structure
+	KeyRevision     uint16   // Key revision
+	Unused          uint16   // Reserved
+}
+
+// Serialize converts the wrapped meta crypto state to bytes
+func (wmcs *WrappedMetaCryptoState) Serialize() ([]byte, error) {
+	buf := &bytes.Buffer{}
+	err := binary.Write(buf, binary.LittleEndian, wmcs)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// Parse parses a wrapped meta crypto state from bytes
+func (wmcs *WrappedMetaCryptoState) Parse(data []byte) error {
+	if len(data) < binary.Size(WrappedMetaCryptoState{}) {
+		return ErrStructTooShort
+	}
+	return binary.Read(bytes.NewReader(data), binary.LittleEndian, wmcs)
+}
+
+// GetProtectionClass returns the protection class for this meta crypto state
+func (wmcs *WrappedMetaCryptoState) GetProtectionClass() uint32 {
+	return wmcs.PersistentClass & CPEffectiveClassMask
+}
+
+// KeybagEntry represents an entry in a keybag (keybag_entry_t)
+type KeybagEntry struct {
+	UUID     [16]byte  // UUID associated with this entry
+	Tag      uint16    // Tag describing the kind of data
+	KeyLen   uint16    // Length of the key data
+	Padding  [4]byte   // Reserved
+	KeyData  []byte    // Key data (variable length)
+}
+
+// Serialize converts the keybag entry to bytes
+func (ke *KeybagEntry) Serialize() ([]byte, error) {
+	size := 24 + len(ke.KeyData) // Fixed fields + key data
+	buf := make([]byte, size)
+	
+	copy(buf[:16], ke.UUID[:])
+	binary.LittleEndian.PutUint16(buf[16:18], ke.Tag)
+	binary.LittleEndian.PutUint16(buf[18:20], uint16(len(ke.KeyData)))
+	copy(buf[20:24], ke.Padding[:])
+	
+	if len(ke.KeyData) > 0 {
+		copy(buf[24:], ke.KeyData)
+	}
+	
+	return buf, nil
+}
+
+// Parse parses a keybag entry from bytes
+func (ke *KeybagEntry) Parse(data []byte) error {
+	if len(data) < 24 {
+		return ErrStructTooShort
+	}
+	
+	copy(ke.UUID[:], data[:16])
+	
+	ke.Tag = binary.LittleEndian.Uint16(data[16:18])
+	ke.KeyLen = binary.LittleEndian.Uint16(data[18:20])
+	copy(ke.Padding[:], data[20:24])
+	
+	if ke.KeyLen > 0 && len(data) >= 24+int(ke.KeyLen) {
+		ke.KeyData = make([]byte, ke.KeyLen)
+		copy(ke.KeyData, data[24:24+ke.KeyLen])
+	}
+	
+	return nil
+}
+
+// String returns a string representation of the keybag entry
+func (ke *KeybagEntry) String() string {
+	return fmt.Sprintf("KeybagEntry{UUID: %x, Tag: %d, KeyLen: %d}",
+		ke.UUID, ke.Tag, ke.KeyLen)
+}
+
+// KBLocker represents a keybag (kb_locker_t)
+type KBLocker struct {
+	Version  uint16         // Keybag version
+	NKeys    uint16         // Number of entries in the keybag
+	NBytes   uint32         // Size in bytes of the data stored in the entries
+	Padding  [8]byte        // Reserved
+	Entries  []KeybagEntry  // The entries
+}
+
+// Serialize converts the keybag to bytes
+func (kbl *KBLocker) Serialize() ([]byte, error) {
+	// Calculate total size needed
+	size := 16 // Fixed fields
+	for _, entry := range kbl.Entries {
+		size += 24 + len(entry.KeyData)
+	}
+	
+	buf := make([]byte, size)
+	
+	binary.LittleEndian.PutUint16(buf[0:2], kbl.Version)
+	binary.LittleEndian.PutUint16(buf[2:4], uint16(len(kbl.Entries)))
+	binary.LittleEndian.PutUint32(buf[4:8], kbl.NBytes)
+	copy(buf[8:16], kbl.Padding[:])
+	
+	offset := 16
+	for _, entry := range kbl.Entries {
+		entryBytes, err := entry.Serialize()
+		if err != nil {
+			return nil, err
+		}
 		
-		// Read UUID
-		copy(entry.KeUUID[:], unwrappedData[pos:pos+16])
-		pos += 16
-
-		// Read tag and keylen
-		err = binary.Read(bytes.NewReader(unwrappedData[pos:]), binary.LittleEndian, &entry.KeTag)
-		if err != nil {
-			return nil, err
-		}
-		pos += 2
-
-		err = binary.Read(bytes.NewReader(unwrappedData[pos:]), binary.LittleEndian, &entry.KeKeylen)
-		if err != nil {
-			return nil, err
-		}
-		pos += 2
-
-		// Skip padding
-		pos += 4
-
-		// Read key data
-		entry.KeKeydata = make([]byte, entry.KeKeylen)
-		copy(entry.KeKeydata, unwrappedData[pos:pos+int(entry.KeKeylen)])
-		pos += int(entry.KeKeylen)
-
-		// Align to 8-byte boundary
-		if pos%8 != 0 {
-			pos += 8 - (pos % 8)
-		}
+		copy(buf[offset:offset+len(entryBytes)], entryBytes)
+		offset += len(entryBytes)
 	}
-
-	return keybag, nil
+	
+	return buf, nil
 }
 
-// unwrapKeybag unwraps a keybag using the device UUID
-func (ctx *EncryptionContext) unwrapKeybag(data []byte, uuid []byte) ([]byte, error) {
-	// This is a simplified implementation of RFC 3394 AES key unwrapping
-	// In a real implementation, you would use a proper RFC 3394 implementation
-
-	// For demo purposes, we'll XOR the keybag data with the UUID
-	// This is NOT the real algorithm, but shows the concept
-	result := make([]byte, len(data))
-	for i := 0; i < len(data); i++ {
-		result[i] = data[i] ^ uuid[i%16]
+// Parse parses a keybag from bytes
+func (kbl *KBLocker) Parse(data []byte) error {
+	if len(data) < 16 {
+		return ErrStructTooShort
 	}
-
-	return result, nil
-}
-
-// findVolumeKeybagLocation finds the volume keybag location in the container keybag
-func (ctx *EncryptionContext) findVolumeKeybagLocation() (*struct{ Start, Blocks uint64 }, error) {
-	// Find the volume UUID
-	volumeUUID := ctx.volume.superblock.VolUUID
-
-	// Look for a volume unlock records entry with matching UUID
-	for _, entry := range ctx.containerKeybag.KlEntries {
-		if bytes.Equal(entry.KeUUID[:], volumeUUID[:]) && entry.KeTag == KBTagVolumeUnlockRecords {
-			// This entry contains the volume keybag location
-			var location struct{ Start, Blocks uint64 }
-			err := binary.Read(bytes.NewReader(entry.KeKeydata), binary.LittleEndian, &location)
+	
+	kbl.Version = binary.LittleEndian.Uint16(data[0:2])
+	kbl.NKeys = binary.LittleEndian.Uint16(data[2:4])
+	kbl.NBytes = binary.LittleEndian.Uint32(data[4:8])
+	copy(kbl.Padding[:], data[8:16])
+	
+	if kbl.NKeys > 0 {
+		kbl.Entries = make([]KeybagEntry, 0, kbl.NKeys)
+		offset := 16
+		
+		for i := uint16(0); i < kbl.NKeys; i++ {
+			if offset >= len(data) {
+				return ErrStructTooShort
+			}
+			
+			entry := KeybagEntry{}
+			err := entry.Parse(data[offset:])
 			if err != nil {
-				return nil, err
+				return err
 			}
-			return &location, nil
+			
+			kbl.Entries = append(kbl.Entries, entry)
+			offset += 24 + int(entry.KeyLen)
 		}
 	}
-
-	return nil, ErrEncryptionNotFound
-}
-
-// findVolumeKey finds the volume encryption key in the container keybag
-func (ctx *EncryptionContext) findVolumeKey() (*VolumeEncryptionKey, error) {
-	// Find the volume UUID
-	volumeUUID := ctx.volume.superblock.VolUUID
-
-	// Look for a volume key entry with matching UUID
-	for _, entry := range ctx.containerKeybag.KlEntries {
-		if bytes.Equal(entry.KeUUID[:], volumeUUID[:]) && entry.KeTag == KBTagVolumeKey {
-			// This entry contains the wrapped VEK
-			vek := &VolumeEncryptionKey{
-				wrapped: entry.KeKeydata,
-				type_:   CRYPTO_SW_ID,
-			}
-			return vek, nil
-		}
-	}
-
-	return nil, ErrEncryptionNotFound
-}
-
-// findVolumeUnlockKey finds the volume unlock key (KEK) in the volume keybag
-func (ctx *EncryptionContext) findVolumeUnlockKey() (*KeyEncryptionKey, error) {
-	// Look for a volume unlock records entry
-	for _, entry := range ctx.volumeKeybag.KlEntries {
-		if entry.KeTag == KBTagVolumeUnlockRecords {
-			// This entry contains the wrapped KEK
-			kek := &KeyEncryptionKey{
-				wrapped: entry.KeKeydata,
-				type_:   CRYPTO_SW_ID,
-			}
-			return kek, nil
-		}
-	}
-
-	return nil, ErrEncryptionNotFound
-}
-
-// findPassphraseHint finds the passphrase hint in the volume keybag
-func (ctx *EncryptionContext) findPassphraseHint() (string, error) {
-	// Look for a passphrase hint entry
-	for _, entry := range ctx.volumeKeybag.KlEntries {
-		if entry.KeTag == KBTagVolumePassphraseHint {
-			// This entry contains the hint as plain text
-			return string(entry.KeKeydata), nil
-		}
-	}
-
-	return "", nil // No hint found, but that's not an error
-}
-
-// Decrypt decrypts the volume using the provided password
-func (ctx *EncryptionContext) Decrypt(password string) error {
-	// Check if already decrypted
-	if ctx.isDecrypted {
-		return nil
-	}
-
-	// First, find the volume key (VEK) in the container keybag
-	vek, err := ctx.findVolumeKey()
-	if err != nil {
-		return err
-	}
-	ctx.vek = vek
-
-	// Next, find the volume unlock key (KEK) in the volume keybag
-	kek, err := ctx.findVolumeUnlockKey()
-	if err != nil {
-		return err
-	}
-
-	// Derive the key from the password
-	derivedKey := ctx.deriveKeyFromPassword(password)
-
-	// Unwrap the KEK using the derived key
-	kek.unwrapped, err = ctx.unwrapKey(kek.wrapped, derivedKey)
-	if err != nil {
-		return ErrInvalidPassword
-	}
-
-	// Unwrap the VEK using the unwrapped KEK
-	vek.unwrapped, err = ctx.unwrapKey(vek.wrapped, kek.unwrapped)
-	if err != nil {
-		return err
-	}
-
-	ctx.isDecrypted = true
-	ctx.passphrase = password
+	
 	return nil
 }
 
-// DecryptWithRecoveryKey decrypts the volume using the provided recovery key
-func (ctx *EncryptionContext) DecryptWithRecoveryKey(recoveryKey string) error {
-	// Check if already decrypted
-	if ctx.isDecrypted {
-		return nil
-	}
-
-	// First, find the volume key (VEK) in the container keybag
-	vek, err := ctx.findVolumeKey()
-	if err != nil {
-		return err
-	}
-	ctx.vek = vek
-
-	// Look for a personal recovery key entry
-	found := false
-	var kek *KeyEncryptionKey
-	for _, entry := range ctx.volumeKeybag.KlEntries {
-		if bytes.Equal(entry.KeUUID[:], []byte(APFS_FV_PERSONAL_RECOVERY_KEY_UUID)) && 
-		   entry.KeTag == KBTagVolumeUnlockRecords {
-			// This entry contains the KEK for recovery
-			kek = &KeyEncryptionKey{
-				wrapped: entry.KeKeydata,
-				type_:   CRYPTO_SW_ID,
-			}
-			found = true
-			break
+// FindEntry finds a keybag entry by UUID and tag
+func (kbl *KBLocker) FindEntry(uuid [16]byte, tag uint16) *KeybagEntry {
+	for i := range kbl.Entries {
+		if bytes.Equal(kbl.Entries[i].UUID[:], uuid[:]) && kbl.Entries[i].Tag == tag {
+			return &kbl.Entries[i]
 		}
 	}
-
-	if !found {
-		return ErrEncryptionNotFound
-	}
-
-	// Parse and validate the recovery key
-	derivedKey, err := ctx.parseRecoveryKey(recoveryKey)
-	if err != nil {
-		return err
-	}
-
-	// Unwrap the KEK using the derived key
-	kek.unwrapped, err = ctx.unwrapKey(kek.wrapped, derivedKey)
-	if err != nil {
-		return ErrInvalidPassword
-	}
-
-	// Unwrap the VEK using the unwrapped KEK
-	vek.unwrapped, err = ctx.unwrapKey(vek.wrapped, kek.unwrapped)
-	if err != nil {
-		return err
-	}
-
-	ctx.isDecrypted = true
-	ctx.recoveryKey = recoveryKey
 	return nil
 }
 
-// deriveKeyFromPassword derives an encryption key from a password
-func (ctx *EncryptionContext) deriveKeyFromPassword(password string) []byte {
-	// In a real implementation, this would use PBKDF2 with the correct parameters
-	// For simplicity, we'll just use a SHA-256 hash of the password
-	hash := sha256.Sum256([]byte(password))
-	return hash[:]
+// String returns a string representation of the keybag
+func (kbl *KBLocker) String() string {
+	return fmt.Sprintf("KBLocker{Version: %d, NKeys: %d, NBytes: %d}",
+		kbl.Version, kbl.NKeys, kbl.NBytes)
 }
 
-// parseRecoveryKey parses a recovery key string into a key
-func (ctx *EncryptionContext) parseRecoveryKey(recoveryKey string) ([]byte, error) {
-	// In a real implementation, this would:
-	// 1. Parse the recovery key format (usually groups of characters)
-	// 2. Validate the checksum/format
-	// 3. Convert to a binary key
-
-	// For simplicity, we'll just use a SHA-256 hash of the recovery key
-	hash := sha256.Sum256([]byte(recoveryKey))
-	return hash[:], nil
+// MediaKeybag represents a keybag in a container (media_keybag_t)
+type MediaKeybag struct {
+	Obj    ObjectPhys  // Object header
+	Locker KBLocker    // Keybag
 }
 
-// unwrapKey unwraps a key using a key encryption key
-func (ctx *EncryptionContext) unwrapKey(wrappedKey, kek []byte) ([]byte, error) {
-	// This is a simplified implementation of RFC 3394 AES key unwrapping
-	// In a real implementation, you would use a proper RFC 3394 implementation
-
-	// For demo purposes, we'll XOR the wrapped key with the KEK
-	// This is NOT the real algorithm, but shows the concept
-	result := make([]byte, len(wrappedKey))
-	for i := 0; i < len(wrappedKey); i++ {
-		result[i] = wrappedKey[i] ^ kek[i%len(kek)]
-	}
-
-	return result, nil
-}
-
-// GetPassphraseHint returns the password hint, if available
-func (ctx *EncryptionContext) GetPassphraseHint() (string, error) {
-	return ctx.findPassphraseHint()
-}
-
-// IsDecrypted returns true if the volume is decrypted
-func (ctx *EncryptionContext) IsDecrypted() bool {
-	return ctx.isDecrypted
-}
-
-// DecryptBlock decrypts a block of data
-func (ctx *EncryptionContext) DecryptBlock(data []byte, physicalBlockNum uint64, cryptoID uint64) ([]byte, error) {
-	if !ctx.isDecrypted {
-		return nil, ErrNoKeyAvailable
-	}
-
-	if ctx.vek == nil || ctx.vek.unwrapped == nil {
-		return nil, ErrNoKeyAvailable
-	}
-
-	// Create AES-XTS cipher
-	result := make([]byte, len(data))
-	tweak := cryptoID
-
-	if ctx.useSoftwareXTS {
-		// Software encryption (AES-XTS with the volume encryption key)
-		err := ctx.decryptBlockAESXTS(data, result, ctx.vek.unwrapped, tweak)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		// Hardware encryption - in a real implementation, this would use 
-		// platform-specific APIs
-		return nil, ErrWrongEncryptionType
-	}
-
-	return result, nil
-}
-
-// decryptBlockAESXTS decrypts a block using AES-XTS
-func (ctx *EncryptionContext) decryptBlockAESXTS(ciphertext, plaintext, key []byte, tweak uint64) error {
-	// AES-XTS requires a key that's twice the length of a normal AES key
-	// The first half is used for encryption, the second half for the tweak
-	if len(key) < 32 {
-		return errors.New("key must be at least 32 bytes for AES-XTS")
-	}
-
-	// Create two AES ciphers, one for encryption and one for the tweak
-	cipher1, err := aes.NewCipher(key[:16])
+// Serialize converts the media keybag to bytes
+func (mk *MediaKeybag) Serialize() ([]byte, error) {
+	objBytes, err := mk.Obj.Serialize()
 	if err != nil {
-		return err
-	}
-
-	cipher2, err := aes.NewCipher(key[16:32])
-	if err != nil {
-		return err
-	}
-
-	// Create the XTS mode
-	xts, err := newXTSMode(cipher1, cipher2)
-	if err != nil {
-		return err
-	}
-
-	// Convert tweak to a byte array
-	tweakBytes := make([]byte, 16)
-	binary.LittleEndian.PutUint64(tweakBytes, tweak)
-
-	// Decrypt the data
-	xts.Decrypt(plaintext, ciphertext, tweakBytes)
-
-	return nil
-}
-
-// EncryptBlock encrypts a block of data
-func (ctx *EncryptionContext) EncryptBlock(data []byte, physicalBlockNum uint64, cryptoID uint64) ([]byte, error) {
-	if !ctx.isDecrypted {
-		return nil, ErrNoKeyAvailable
-	}
-
-	if ctx.vek == nil || ctx.vek.unwrapped == nil {
-		return nil, ErrNoKeyAvailable
-	}
-
-	// Create AES-XTS cipher
-	result := make([]byte, len(data))
-	tweak := cryptoID
-
-	if ctx.useSoftwareXTS {
-		// Software encryption (AES-XTS with the volume encryption key)
-		err := ctx.encryptBlockAESXTS(data, result, ctx.vek.unwrapped, tweak)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		// Hardware encryption - in a real implementation, this would use 
-		// platform-specific APIs
-		return nil, ErrWrongEncryptionType
-	}
-
-	return result, nil
-}
-
-// encryptBlockAESXTS encrypts a block using AES-XTS
-func (ctx *EncryptionContext) encryptBlockAESXTS(plaintext, ciphertext, key []byte, tweak uint64) error {
-	// AES-XTS requires a key that's twice the length of a normal AES key
-	// The first half is used for encryption, the second half for the tweak
-	if len(key) < 32 {
-		return errors.New("key must be at least 32 bytes for AES-XTS")
-	}
-
-	// Create two AES ciphers, one for encryption and one for the tweak
-	cipher1, err := aes.NewCipher(key[:16])
-	if err != nil {
-		return err
-	}
-
-	cipher2, err := aes.NewCipher(key[16:32])
-	if err != nil {
-		return err
-	}
-
-	// Create the XTS mode
-	xts, err := newXTSMode(cipher1, cipher2)
-	if err != nil {
-		return err
-	}
-
-	// Convert tweak to a byte array
-	tweakBytes := make([]byte, 16)
-	binary.LittleEndian.PutUint64(tweakBytes, tweak)
-
-	// Encrypt the data
-	xts.Encrypt(ciphertext, plaintext, tweakBytes)
-
-	return nil
-}
-
-// XTS-AES mode implementation (simplified)
-type xtsMode struct {
-	cipher1 cipher.Block
-	cipher2 cipher.Block
-}
-
-func newXTSMode(cipher1, cipher2 cipher.Block) (*xtsMode, error) {
-	if cipher1.BlockSize() != cipher2.BlockSize() {
-		return nil, errors.New("cipher block sizes must be equal")
+		return nil, err
 	}
 	
-	return &xtsMode{
-		cipher1: cipher1,
-		cipher2: cipher2,
-	}, nil
+	lockerBytes, err := mk.Locker.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	
+	buf := make([]byte, len(objBytes)+len(lockerBytes))
+	copy(buf, objBytes)
+	copy(buf[len(objBytes):], lockerBytes)
+	
+	return buf, nil
 }
 
-// Encrypt encrypts plaintext to ciphertext using XTS mode
-func (x *xtsMode) Encrypt(ciphertext, plaintext, tweak []byte) {
-	// This is a simplified implementation
-	// In a real implementation, this would follow the XTS specification
+// Parse parses a media keybag from bytes
+func (mk *MediaKeybag) Parse(data []byte) error {
+	if len(data) < binary.Size(ObjectPhys{}) {
+		return ErrStructTooShort
+	}
 	
-	// For demo purposes, we'll just XOR the plaintext with the tweak
-	// and then encrypt with the first cipher
-	blockSize := x.cipher1.BlockSize()
+	err := mk.Obj.Parse(data)
+	if err != nil {
+		return err
+	}
 	
-	// Process each block
-	for i := 0; i < len(plaintext); i += blockSize {
-		end := i + blockSize
-		if end > len(plaintext) {
-			end = len(plaintext)
-		}
-		
-		// XOR plaintext with tweak
-		for j := i; j < end; j++ {
-			ciphertext[j] = plaintext[j] ^ tweak[j-i]
-		}
-		
-		// Encrypt the block
-		x.cipher1.Encrypt(ciphertext[i:end], ciphertext[i:end])
+	return mk.Locker.Parse(data[binary.Size(ObjectPhys{}):])
+}
+
+// String returns a string representation of the media keybag
+func (mk *MediaKeybag) String() string {
+	return fmt.Sprintf("MediaKeybag{Obj: %s, Locker: %s}",
+		mk.Obj.String(), mk.Locker.String())
+}
+
+// EncryptionContext manages encryption/decryption operations
+type EncryptionContext struct {
+	containerUUID        [16]byte
+	volumeUUID           [16]byte
+	volumeEncryptionKey  []byte
+	usesSoftwareEncryption bool
+	isDecrypted          bool
+}
+
+// NewEncryptionContext creates a new encryption context
+func NewEncryptionContext(volumeUUID, containerUUID [16]byte) *EncryptionContext {
+	return &EncryptionContext{
+		volumeUUID:            volumeUUID,
+		containerUUID:         containerUUID,
+		usesSoftwareEncryption: true,
+		isDecrypted:           false,
 	}
 }
 
-// Decrypt decrypts ciphertext to plaintext using XTS mode
-func (x *xtsMode) Decrypt(plaintext, ciphertext, tweak []byte) {
-	// This is a simplified implementation
-	// In a real implementation, this would follow the XTS specification
-	
-	// For demo purposes, we'll just decrypt with the first cipher
-	// and then XOR with the tweak
-	blockSize := x.cipher1.BlockSize()
-	
-	// Process each block
-	for i := 0; i < len(ciphertext); i += blockSize {
-		end := i + blockSize
-		if end > len(ciphertext) {
-			end = len(ciphertext)
-		}
-		
-		// Decrypt the block
-		x.cipher1.Decrypt(plaintext[i:end], ciphertext[i:end])
-		
-		// XOR plaintext with tweak
-		for j := i; j < end; j++ {
-			plaintext[j] = plaintext[j] ^ tweak[j-i]
-		}
-	}
+// IsDecrypted returns whether the volume has been decrypted
+func (ec *EncryptionContext) IsDecrypted() bool {
+	return ec.isDecrypted
 }
 
-// ChangeFVPassword changes the FileVault password
-func (ctx *EncryptionContext) ChangeFVPassword(oldPassword, newPassword string) error {
-	// Check if decrypted with the old password
-	if !ctx.isDecrypted || ctx.passphrase != oldPassword {
-		// Try to decrypt with the old password first
-		err := ctx.Decrypt(oldPassword)
-		if err != nil {
-			return err
-		}
-	}
+// SetVolumeEncryptionKey sets the volume encryption key
+func (ec *EncryptionContext) SetVolumeEncryptionKey(key []byte) {
+	ec.volumeEncryptionKey = key
+	ec.isDecrypted = true
+}
 
-	// Find the KEK in the volume keybag
+// UnlockWithPassword unlocks the volume with a password
+func (ec *EncryptionContext) UnlockWithPassword(password string, containerKeybag, volumeKeybag *KBLocker) error {
+	if containerKeybag == nil || volumeKeybag == nil {
+		return errors.New("keybags are required for unlocking")
+	}
+	
+	// Find the volume key entry in the container keybag
+	volumeKeyEntry := containerKeybag.FindEntry(ec.volumeUUID, KBTagVolumeKey)
+	if volumeKeyEntry == nil {
+		return errors.New("volume key not found in container keybag")
+	}
+	
+	// Find the user's KEK in the volume keybag
 	var kekEntry *KeybagEntry
-	for i := range ctx.volumeKeybag.KlEntries {
-		if ctx.volumeKeybag.KlEntries[i].KeTag == KBTagVolumeUnlockRecords {
-			kekEntry = &ctx.volumeKeybag.KlEntries[i]
+	for i := range volumeKeybag.Entries {
+		if volumeKeybag.Entries[i].Tag == KBTagVolumeUnlockRecords {
+			kekEntry = &volumeKeybag.Entries[i]
 			break
 		}
 	}
 	
 	if kekEntry == nil {
-		return ErrEncryptionNotFound
-	}
-
-	// Derive a new key from the new password
-	newDerivedKey := ctx.deriveKeyFromPassword(newPassword)
-
-	// Re-wrap the KEK with the new derived key
-	var err error
-	kekEntry.KeKeydata, err = ctx.wrapKey(ctx.vek.unwrapped, newDerivedKey)
-	if err != nil {
-		return err
-	}
-
-	// Update the volume keybag on disk
-	// In a real implementation, this would rewrite the keybag
-	
-	// Update context
-	ctx.passphrase = newPassword
-	
-	return nil
-}
-
-// wrapKey wraps a key using a key encryption key
-func (ctx *EncryptionContext) wrapKey(key, kek []byte) ([]byte, error) {
-	// This is a simplified implementation of RFC 3394 AES key wrapping
-	// In a real implementation, you would use a proper RFC 3394 implementation
-
-	// For demo purposes, we'll XOR the key with the KEK
-	// This is NOT the real algorithm, but shows the concept
-	result := make([]byte, len(key))
-	for i := 0; i < len(key); i++ {
-		result[i] = key[i] ^ kek[i%len(kek)]
-	}
-
-	return result, nil
-}
-
-// AddRecoveryKey adds a personal recovery key to the volume
-func (ctx *EncryptionContext) AddRecoveryKey() (string, error) {
-	// Check if decrypted
-	if !ctx.isDecrypted {
-		return "", ErrNoKeyAvailable
-	}
-
-	// Generate a random recovery key
-	recoveryKey := ctx.generateRecoveryKey()
-
-	// Derive key from recovery key
-	derivedKey, err := ctx.parseRecoveryKey(recoveryKey)
-	if err != nil {
-		return "", err
-	}
-
-	// Wrap the VEK with the derived key
-	wrappedVEK, err := ctx.wrapKey(ctx.vek.unwrapped, derivedKey)
-	if err != nil {
-		return "", err
-	}
-
-	// Create a new keybag entry
-	entry := KeybagEntry{
-		KeTag:    KBTagVolumeUnlockRecords,
-		KeKeylen: uint16(len(wrappedVEK)),
-		KeKeydata: wrappedVEK,
+		return errors.New("no unlock records found in volume keybag")
 	}
 	
-	// Set the UUID to the recovery key UUID
-	copy(entry.KeUUID[:], []byte(APFS_FV_PERSONAL_RECOVERY_KEY_UUID))
-
-	// Add to the volume keybag
-	ctx.volumeKeybag.KlEntries = append(ctx.volumeKeybag.KlEntries, entry)
-	ctx.volumeKeybag.KlNkeys++
-
-	// Update the volume keybag on disk
-	// In a real implementation, this would rewrite the keybag
-
-	return recoveryKey, nil
-}
-
-// generateRecoveryKey generates a new random recovery key
-func (ctx *EncryptionContext) generateRecoveryKey() string {
-	// In a real implementation, this would generate a proper recovery key
-	// with the correct format and checksum
+	// Derive a key from the password using SHA-256
+	// In a real implementation, this would use PBKDF2 with salt and iterations
+	passDerivedKey := make([]byte, 32)
+	h := sha256.New()
+	h.Write([]byte(password))
+	copy(passDerivedKey, h.Sum(nil))
 	
-	// For simplicity, we'll just generate a random string
-	return "ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ"
-}
-
-// RemoveRecoveryKey removes the personal recovery key from the volume
-func (ctx *EncryptionContext) RemoveRecoveryKey() error {
-	// Check if decrypted
-	if !ctx.isDecrypted {
-		return ErrNoKeyAvailable
-	}
-
-	// Find the recovery key entry
-	found := false
-	var newEntries []KeybagEntry
-	for _, entry := range ctx.volumeKeybag.KlEntries {
-		// Keep all entries except the recovery key
-		if !bytes.Equal(entry.KeUUID[:], []byte(APFS_FV_PERSONAL_RECOVERY_KEY_UUID)) || 
-		   entry.KeTag != KBTagVolumeUnlockRecords {
-			newEntries = append(newEntries, entry)
-		} else {
-			found = true
-		}
-	}
-
-	if !found {
-		return ErrEncryptionNotFound
-	}
-
-	// Update the keybag
-	ctx.volumeKeybag.KlEntries = newEntries
-	ctx.volumeKeybag.KlNkeys = uint16(len(newEntries))
-
-	// Update the volume keybag on disk
-	// In a real implementation, this would rewrite the keybag
-
-	return nil
-}
-
-// SetPassphraseHint sets a hint for the volume password
-func (ctx *EncryptionContext) SetPassphraseHint(hint string) error {
-	// Check if decrypted
-	if !ctx.isDecrypted {
-		return ErrNoKeyAvailable
-	}
-
-	// Find the hint entry
-	found := false
-	for i := range ctx.volumeKeybag.KlEntries {
-		if ctx.volumeKeybag.KlEntries[i].KeTag == KBTagVolumePassphraseHint {
-			// Update existing hint
-			ctx.volumeKeybag.KlEntries[i].KeKeylen = uint16(len(hint))
-			ctx.volumeKeybag.KlEntries[i].KeKeydata = []byte(hint)
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		// Create a new hint entry
-		entry := KeybagEntry{
-			KeTag:    KBTagVolumePassphraseHint,
-			KeKeylen: uint16(len(hint)),
-			KeKeydata: []byte(hint),
-		}
-		ctx.volumeKeybag.KlEntries = append(ctx.volumeKeybag.KlEntries, entry)
-		ctx.volumeKeybag.KlNkeys++
-	}
-
-	// Update the volume keybag on disk
-	// In a real implementation, this would rewrite the keybag
-
-	return nil
-}
-
-package apfs
-
-// EnableVolumeEncryption encrypts an unencrypted volume
-func (vm *VolumeManager) EnableVolumeEncryption(tx *Transaction, password string) error {
-	// Check if already encrypted
-	if (vm.superblock.FSFlags & APFSFSUnencrypted) == 0 {
-		return errors.New("volume is already encrypted")
-	}
-
-	// In a real implementation, this would:
-	// 1. Generate a new volume encryption key (VEK)
-	// 2. Create a container keybag entry for the volume
-	// 3. Create a volume keybag with the password-based KEK
-	// 4. Start the encryption process for all files
-
-	// Set the volume flags
-	vm.superblock.FSFlags &= ^uint64(APFSFSUnencrypted)
-
-	// Set the container flags for software encryption
-	vm.container.superblock.Flags |= NX_CRYPTO_SW
-
-	// Set the encryption rolling state
-	// In a real implementation, this would create an ER_STATE_PHYS object
-	vm.superblock.ERStateOID = vm.container.superblock.NextOID
-	vm.container.superblock.NextOID++
-
-	// Mark the volume as encrypting
-	vm.omap.physicalObj.OmFlags |= OMAP_ENCRYPTING
-
-	return nil
-}
-
-// DisableVolumeEncryption decrypts an encrypted volume
-func (vm *VolumeManager) DisableVolumeEncryption(tx *Transaction, password string) error {
-	// Check if encrypted
-	if (vm.superblock.FSFlags & APFSFSUnencrypted) != 0 {
-		return errors.New("volume is not encrypted")
-	}
-
-	// Create an encryption context
-	ctx, err := NewEncryptionContext(vm.container, vm)
+	// Use the derived key to unwrap the KEK
+	kek, err := UnwrapKey(passDerivedKey, kekEntry.KeyData)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to unwrap KEK: %w", err)
 	}
-
-	// Decrypt the volume
-	err = ctx.Decrypt(password)
+	
+	// Use the KEK to unwrap the VEK
+	vek, err := UnwrapKey(kek, volumeKeyEntry.KeyData)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to unwrap VEK: %w", err)
 	}
-
-	// In a real implementation, this would:
-	// 1. Start the decryption process for all files
-	// 2. Remove the keybags
-
-	// Set the volume flags
-	vm.superblock.FSFlags |= APFSFSUnencrypted
-
-	// Mark the volume as decrypting
-	vm.omap.physicalObj.OmFlags |= OMAP_DECRYPTING
-
+	
+	// Store the VEK in the encryption context
+	ec.volumeEncryptionKey = vek
+	ec.isDecrypted = true
+	
 	return nil
 }
 
-// GetFileKey gets a file's encryption key
-func (ctx *EncryptionContext) GetFileKey(file *File) ([]byte, error) {
-	// Check if decrypted
-	if !ctx.isDecrypted {
-		return nil, ErrNoKeyAvailable
+// UnlockWithRecoveryKey unlocks the volume with a recovery key
+func (ec *EncryptionContext) UnlockWithRecoveryKey(recoveryKey string, containerKeybag, volumeKeybag *KBLocker) error {
+	if containerKeybag == nil || volumeKeybag == nil {
+		return errors.New("keybags are required for unlocking")
 	}
-
-	// Check if we're using per-volume encryption (software encryption)
-	if (ctx.volume.superblock.FSFlags & APFSFSOnekey) != 0 {
-		// Volume encryption key is used for all files
-		return ctx.vek.unwrapped, nil
+	
+	// Find the recovery key entry in the volume keybag
+	var recoveryKeyUUID [16]byte
+	copy(recoveryKeyUUID[:], []byte(APFSFVPersonalRecoveryKeyUUID))
+	
+	recoveryEntry := volumeKeybag.FindEntry(recoveryKeyUUID, KBTagVolumeUnlockRecords)
+	if recoveryEntry == nil {
+		return errors.New("recovery key entry not found in volume keybag")
 	}
-
-	// For per-file encryption, we would need to:
-	// 1. Find the file's crypto state record
-	// 2. Unwrap the file's encryption key
-
-	return nil, ErrNotImplemented
-}
-
-// RollEncryptionKeys rolls the volume's encryption keys
-func (ctx *EncryptionContext) RollEncryptionKeys(password string) error {
-	// Check if decrypted
-	if !ctx.isDecrypted {
-		// Decrypt first
-		err := ctx.Decrypt(password)
-		if err != nil {
-			return err
-		}
+	
+	// Find the volume key entry in the container keybag
+	volumeKeyEntry := containerKeybag.FindEntry(ec.volumeUUID, KBTagVolumeKey)
+	if volumeKeyEntry == nil {
+		return errors.New("volume key not found in container keybag")
 	}
-
-	// In a real implementation, this would:
-	// 1. Generate a new volume encryption key
-	// 2. Re-wrap all keys with the new VEK
-	// 3. Mark the volume as key rolling
-	// 4. Start the key rolling process
-
-	// Mark the volume as key rolling
-	ctx.volume.omap.physicalObj.OmFlags |= OMAP_KEYROLLING
-
-	// Toggle crypto generation flags
-	ctx.volume.omap.physicalObj.OmFlags ^= OMAP_CRYPTO_GENERATION
-
+	
+	// Derive a key from the recovery key
+	// In a real implementation, the recovery key is typically a 32-character string
+	// that's decoded to create the wrapping key
+	recoveryDerivedKey := make([]byte, 32)
+	h := sha256.New()
+	h.Write([]byte(recoveryKey))
+	copy(recoveryDerivedKey, h.Sum(nil))
+	
+	// Use the derived key to unwrap the KEK
+	kek, err := UnwrapKey(recoveryDerivedKey, recoveryEntry.KeyData)
+	if err != nil {
+		return fmt.Errorf("failed to unwrap KEK with recovery key: %w", err)
+	}
+	
+	// Use the KEK to unwrap the VEK
+	vek, err := UnwrapKey(kek, volumeKeyEntry.KeyData)
+	if err != nil {
+		return fmt.Errorf("failed to unwrap VEK: %w", err)
+	}
+	
+	// Store the VEK in the encryption context
+	ec.volumeEncryptionKey = vek
+	ec.isDecrypted = true
+	
 	return nil
 }
 
-// IsEncrypted returns true if the volume is encrypted
-func (vm *VolumeManager) IsEncrypted() bool {
-	return (vm.superblock.FSFlags & APFSFSUnencrypted) == 0
-}
-
-// IsFVEnabled returns true if FileVault is enabled
-func (vm *VolumeManager) IsFVEnabled() bool {
-	// Check if the volume is encrypted
-	if (vm.superblock.FSFlags & APFSFSUnencrypted) != 0 {
-		return false
+// DecryptBlock decrypts a block of data using AES-XTS
+func (ec *EncryptionContext) DecryptBlock(data []byte, physBlockNum, cryptoID uint64) ([]byte, error) {
+	if !ec.isDecrypted {
+		return nil, errors.New("volume not decrypted")
 	}
-
-	// FileVault implies volume-level encryption
-	return (vm.superblock.FSFlags & APFSFSOnekey) != 0
-}
-
-// IsEncryptionInProgress returns true if encryption is in progress
-func (vm *VolumeManager) IsEncryptionInProgress() bool {
-	return (vm.omap.physicalObj.OmFlags & OMAP_ENCRYPTING) != 0
-}
-
-// IsDecryptionInProgress returns true if decryption is in progress
-func (vm *VolumeManager) IsDecryptionInProgress() bool {
-	return (vm.omap.physicalObj.OmFlags & OMAP_DECRYPTING) != 0
-}
-
-// IsKeyRollingInProgress returns true if key rolling is in progress
-func (vm *VolumeManager) IsKeyRollingInProgress() bool {
-	return (vm.omap.physicalObj.OmFlags & OMAP_KEYROLLING) != 0
-}
-
-// GetEncryptionProgress returns the progress of encryption/decryption
-func (vm *VolumeManager) GetEncryptionProgress() (float64, error) {
-	// Check if encryption state exists
-	if vm.superblock.ERStateOID == 0 {
-		return 0, ErrEncryptionNotFound
+	
+	// Create the XTS cipher with VEK
+	cipher, err := NewAESXTSCipher(ec.volumeEncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES-XTS cipher: %w", err)
 	}
-
-	// In a real implementation, this would:
-	// 1. Read the encryption rolling state object
-	// 2. Calculate the progress from ersb_progress / ersb_total_blk_to_encrypt
-
-	// For now, return a fake progress
-	return 0.5, nil
+	
+	// Create tweak value from the crypto ID and block number
+	tweak := make([]byte, 16)
+	binary.LittleEndian.PutUint64(tweak, cryptoID)
+	binary.LittleEndian.PutUint64(tweak[8:], physBlockNum)
+	
+	// Decrypt the data
+	decrypted := make([]byte, len(data))
+	err = cipher.Decrypt(decrypted, data, tweak)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt block: %w", err)
+	}
+	
+	return decrypted, nil
 }
 
-// PauseEncryption pauses the encryption/decryption process
-func (vm *VolumeManager) PauseEncryption() error {
-	// Check if encryption state exists
-	if vm.superblock.ERStateOID == 0 {
-		return ErrEncryptionNotFound
+// EncryptBlock encrypts a block of data using AES-XTS
+func (ec *EncryptionContext) EncryptBlock(data []byte, physBlockNum, cryptoID uint64) ([]byte, error) {
+	if !ec.isDecrypted {
+		return nil, errors.New("volume not decrypted")
 	}
-
-	// In a real implementation, this would set the ERSB_FLAG_PAUSED flag
-	// in the encryption rolling state
-
-	return nil
+	
+	// Create the XTS cipher with VEK
+	cipher, err := NewAESXTSCipher(ec.volumeEncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES-XTS cipher: %w", err)
+	}
+	
+	// Create tweak value from the crypto ID and block number
+	tweak := make([]byte, 16)
+	binary.LittleEndian.PutUint64(tweak, cryptoID)
+	binary.LittleEndian.PutUint64(tweak[8:], physBlockNum)
+	
+	// Encrypt the data
+	encrypted := make([]byte, len(data))
+	err = cipher.Encrypt(encrypted, data, tweak)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt block: %w", err)
+	}
+	
+	return encrypted, nil
 }
 
-// ResumeEncryption resumes the encryption/decryption process
-func (vm *VolumeManager) ResumeEncryption() error {
-	// Check if encryption state exists
-	if vm.superblock.ERStateOID == 0 {
-		return ErrEncryptionNotFound
-	}
-
-	// In a real implementation, this would clear the ERSB_FLAG_PAUSED flag
-	// in the encryption rolling state
-
-	return nil
+// AESXTSCipher implements AES-XTS encryption/decryption
+type AESXTSCipher struct {
+	key1Cipher cipher.Block
+	key2Cipher cipher.Block
+	blockSize  int
 }
 
-// DecryptFile reads and decrypts a file's contents
-func (file *File) DecryptFile() ([]byte, error) {
-	// Check if file has data
-	if file.dataStream == nil || file.dataStream.Size == 0 {
-		return []byte{}, nil
+// NewAESXTSCipher creates a new AES-XTS cipher
+func NewAESXTSCipher(key []byte) (*AESXTSCipher, error) {
+	// AES-XTS requires two keys of equal length
+	if len(key) != 32 && len(key) != 48 && len(key) != 64 {
+		return nil, errors.New("AES-XTS key must be 256, 384 or 512 bits (two AES keys)")
 	}
-
-	// Create an encryption context
-	ctx, err := NewEncryptionContext(file.volume.container, file.volume)
+	
+	// Split the key into two equal parts
+	keySize := len(key) / 2
+	key1 := key[:keySize]
+	key2 := key[keySize:]
+	
+	// Create the AES ciphers
+	key1Cipher, err := aes.NewCipher(key1)
 	if err != nil {
 		return nil, err
 	}
-
-	// Check if already decrypted
-	if !ctx.IsDecrypted() {
-		return nil, ErrNoKeyAvailable
-	}
-
-	// Read the raw data
-	data, err := file.Read(0, int(file.dataStream.Size))
+	
+	key2Cipher, err := aes.NewCipher(key2)
 	if err != nil {
 		return nil, err
 	}
-
-	// Decrypt each extent
-	blockSize := int64(file.volume.container.blockSize)
-	decryptedData := make([]byte, len(data))
 	
-	for _, extent := range file.extents {
-		// Calculate the range this extent covers in the file
-		startOffset := extent.LogicalAddr
-		endOffset := startOffset + extent.Length
+	return &AESXTSCipher{
+		key1Cipher: key1Cipher,
+		key2Cipher: key2Cipher,
+		blockSize:  key1Cipher.BlockSize(),
+	}, nil
+}
+
+// multiplyByX multiplies a value by x in GF(2^128)
+func multiplyByX(block []byte) {
+	carry := (block[0] & 0x80) != 0
+	
+	// Shift left by 1
+	for i := 0; i < len(block)-1; i++ {
+		block[i] = (block[i] << 1) | (block[i+1] >> 7)
+	}
+	block[len(block)-1] <<= 1
+	
+	// If there was a carry, XOR with the reduction polynomial
+	if carry {
+		block[len(block)-1] ^= 0x87
+	}
+}
+
+// Encrypt encrypts data using AES-XTS
+func (c *AESXTSCipher) Encrypt(dst, src []byte, tweak []byte) error {
+	if len(dst) < len(src) {
+		return errors.New("output buffer too small")
+	}
+	
+	if len(src) == 0 || len(src)%c.blockSize != 0 {
+		return errors.New("input length must be a multiple of the block size")
+	}
+	
+	if len(tweak) < c.blockSize {
+		return errors.New("tweak must be at least block size bytes")
+	}
+	
+	// Create a work buffer for the tweak
+	T := make([]byte, c.blockSize)
+	copy(T, tweak[:c.blockSize])
+	
+	// Encrypt the tweak with key2
+	c.key2Cipher.Encrypt(T, T)
+	
+	// Process each block
+	for i := 0; i < len(src); i += c.blockSize {
+		// Get the current block
+		block := src[i:i+c.blockSize]
 		
-		// Calculate the corresponding range in our data buffer
-		bufferStart := startOffset
-		bufferEnd := endOffset
-		if bufferEnd > uint64(len(data)) {
-			bufferEnd = uint64(len(data))
+		// XOR the plaintext with the encrypted tweak
+		tmp := make([]byte, c.blockSize)
+		for j := 0; j < c.blockSize; j++ {
+			tmp[j] = block[j] ^ T[j]
 		}
 		
-		// Calculate the number of blocks in this extent
-		startBlock := startOffset / uint64(blockSize)
-		endBlock := (endOffset + uint64(blockSize) - 1) / uint64(blockSize)
+		// Encrypt the result with the first key
+		c.key1Cipher.Encrypt(tmp, tmp)
 		
-		// Decrypt each block
-		for blockNum := startBlock; blockNum < endBlock; blockNum++ {
-			// Calculate the offset of this block in the file
-			blockOffset := blockNum * uint64(blockSize)
-			
-			// Calculate the range this block covers in our data buffer
-			blockStart := blockOffset
-			if blockStart < bufferStart {
-				blockStart = bufferStart
-			}
-			
-			blockEnd := (blockNum + 1) * uint64(blockSize)
-			if blockEnd > bufferEnd {
-				blockEnd = bufferEnd
-			}
-			
-			// Calculate the corresponding range in the extent
-			extentOffset := blockStart - startOffset
-			
-			// Calculate the physical block number
-			physBlock := extent.PhysicalBlock + (blockNum - startBlock)
-			
-			// Decrypt the block
-			blockData := data[blockStart:blockEnd]
-			decryptedBlock, err := ctx.DecryptBlock(blockData, physBlock, extent.CryptoID)
-			if err != nil {
-				return nil, err
-			}
-			
-			// Copy the decrypted data
-			copy(decryptedData[blockStart:blockEnd], decryptedBlock)
+		// XOR with the encrypted tweak again
+		for j := 0; j < c.blockSize; j++ {
+			dst[i+j] = tmp[j] ^ T[j]
+		}
+		
+		// Multiply T by x in GF(2^128) for the next block
+		if i+c.blockSize < len(src) {
+			multiplyByX(T)
 		}
 	}
 	
-	return decryptedData, nil
+	return nil
 }
 
-// EncryptAndWriteFile encrypts and writes data to a file
-func (file *File) EncryptAndWriteFile(tx *Transaction, data []byte) error {
-	// Create an encryption context
-	ctx, err := NewEncryptionContext(file.volume.container, file.volume)
+// Decrypt decrypts data using AES-XTS
+func (c *AESXTSCipher) Decrypt(dst, src []byte, tweak []byte) error {
+	if len(dst) < len(src) {
+		return errors.New("output buffer too small")
+	}
+	
+	if len(src) == 0 || len(src)%c.blockSize != 0 {
+		return errors.New("input length must be a multiple of the block size")
+	}
+	
+	if len(tweak) < c.blockSize {
+		return errors.New("tweak must be at least block size bytes")
+	}
+	
+	// Create a work buffer for the tweak
+	T := make([]byte, c.blockSize)
+	copy(T, tweak[:c.blockSize])
+	
+	// Encrypt the tweak with key2
+	c.key2Cipher.Encrypt(T, T)
+	
+	// Process each block
+	for i := 0; i < len(src); i += c.blockSize {
+		// Get the current block
+		block := src[i:i+c.blockSize]
+		
+		// XOR the ciphertext with the encrypted tweak
+		tmp := make([]byte, c.blockSize)
+		for j := 0; j < c.blockSize; j++ {
+			tmp[j] = block[j] ^ T[j]
+		}
+		
+		// Decrypt the result with the first key
+		c.key1Cipher.Decrypt(tmp, tmp)
+		
+		// XOR with the encrypted tweak again
+		for j := 0; j < c.blockSize; j++ {
+			dst[i+j] = tmp[j] ^ T[j]
+		}
+		
+		// Multiply T by x in GF(2^128) for the next block
+		if i+c.blockSize < len(src) {
+			multiplyByX(T)
+		}
+	}
+	
+	return nil
+}
+
+// UnwrapKey unwraps a key using AES key wrapping (RFC 3394)
+func UnwrapKey(wrappingKey, wrappedKey []byte) ([]byte, error) {
+	if len(wrappingKey) != 16 && len(wrappingKey) != 24 && len(wrappingKey) != 32 {
+		return nil, errors.New("invalid wrapping key size")
+	}
+	
+	if len(wrappedKey) < 8 || len(wrappedKey)%8 != 0 {
+		return nil, errors.New("wrapped key invalid size - must be multiple of 8 bytes")
+	}
+	
+	// Create AES cipher with wrapping key
+	c, err := aes.NewCipher(wrappingKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// Check if already decrypted
-	if !ctx.IsDecrypted() {
-		return ErrNoKeyAvailable
+	
+	// Implement RFC 3394 Key Unwrapping
+	n := (len(wrappedKey) / 8) - 1
+	if n < 1 {
+		return nil, errors.New("wrapped key too short")
 	}
-
-	// In a real implementation, this would:
-	// 1. Allocate blocks for the file
-	// 2. Encrypt the data for each block
-	// 3. Write the encrypted data
-	// 4. Update the file extents
-
-	// For now, just write the data (it will be encrypted by the transaction)
-	return file.Write(tx, 0, data)
-}
-
-
-
+	
+	// Initialize variables
+	A := make([]byte, 8)
+	R := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		R[i] = make([]byte, 8)
+	}
+	
+	// Copy wrapped data into A and R
+	copy(A, wrappedKey[:8])
+	for i := 0; i < n; i++ {
+		copy(R[i], wrappedKey[8*(i+1):8*(i+2)])
+	}
+	
+	// Unwrapping process
+	for j := 5; j >= 0; j-- {
+		for i := n; i >= 1; i-- {
+			// A = MSB(64) of AES-DEC(K, (A ^ t) | R[i])
+			t := uint64(n*j + i)
+			
+			// Create concatenated block: (A ^ t) | R[i]
+			block := make([]byte, 16)
+			
+			// XOR A with t
+			A_xor_t := make([]byte, 8)
+			copy(A_xor_t, A)
+			binary.BigEndian.PutUint64(A_xor_t, binary.BigEndian.Uint64(A_xor_t)^t)
+			
+			// Concatenate (A ^ t) with R[i]
+			copy(block[:8], A_xor_t)
+			copy(block[8:], R[i-1])
+			
+			// AES decrypt
