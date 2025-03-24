@@ -1,4 +1,15 @@
-//
+// space_manager.go
+/*
+spaceman_phys_t: Core structure managing disk-space allocation.
+
+chunk_info_t: Structure describing individual chunk information.
+
+chunk_info_block: Container of multiple chunk_info_t entries.
+
+spaceman_free_queue_t / spaceman_free_queue_entry_t: Managing freed space and blocks to be reclaimed.
+
+spaceman_device_t: Device-specific space manager information.
+*/
 package apfs
 
 import (

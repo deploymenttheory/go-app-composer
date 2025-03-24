@@ -1,4 +1,4 @@
-//
+// btree.go
 package apfs
 
 import (
@@ -6,217 +6,150 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 )
 
-// BTree represents an APFS B-tree
+// BTree represents a B-tree in APFS
 type BTree struct {
-	container  *ContainerManager
-	rootNode   *BTreeNode
-	info       *BTreeInfo
-	treeType   uint32
-	treeSubtype uint32
+	container    *ContainerManager
+	node         *BTreeNodePhys
+	isRoot       bool
+	nodeSize     uint32
+	keySize      uint32
+	valSize      uint32
+	treeType     uint32
+	treeSubType  uint32
+	allowGhosts  bool
+	fixedKVSize  bool
+	nodeIsHashed bool
+	isPhysical   bool
 }
 
-// BTreeNode represents a node in an APFS B-tree
-type BTreeNode struct {
-	tree       *BTree
-	header     BTreeNodePhys
-	data       []byte
-	tableSpace []byte
-	keySpace   []byte
-	valueSpace []byte
-	toc        []KVEntry
+// BTreeNodePhys represents a B-tree node (btree_node_phys_t)
+type BTreeNodePhys struct {
+	BtnO           ObjectPhys // Object header
+	BtnFlags       uint16     // Flags
+	BtnLevel       uint16     // Level in the tree (0 = leaf)
+	BtnNKeys       uint32     // Number of keys in this node
+	BtnTableSpace  NLoc       // Table of contents location info
+	BtnFreeSpace   NLoc       // Free space location info
+	BtnKeyFreeList NLoc       // Free list for keys
+	BtnValFreeList NLoc       // Free list for values
+	BtnData        []byte     // Node data area
 }
 
-// KVEntry represents an entry in a B-tree node's table of contents
-type KVEntry struct {
-	Key    []byte
-	Value  []byte
-	KeyPos uint16  // Offset to the key from the start of the key space
-	ValPos uint16  // Offset to the value from the end of the value space
+// BTreeInfoFixed represents static information about a B-tree (btree_info_fixed_t)
+type BTreeInfoFixed struct {
+	BtFlags    uint32 // B-tree flags
+	BtNodeSize uint32 // Node size in bytes
+	BtKeySize  uint32 // Key size in bytes (0 if variable)
+	BtValSize  uint32 // Value size in bytes (0 if variable)
 }
 
-// NewBTree creates a new B-tree from a root node block
-func NewBTree(container *ContainerManager, rootNodeData []byte) (*BTree, error) {
-	if len(rootNodeData) < binary.Size(BTreeNodePhys{}) {
-		return nil, errors.New("data too short for BTree node")
-	}
+// BTreeInfo represents information about a B-tree (btree_info_t)
+type BTreeInfo struct {
+	BtFixed      BTreeInfoFixed // Fixed information
+	BtLongestKey uint32         // Length of longest key
+	BtLongestVal uint32         // Length of longest value
+	BtKeyCount   uint64         // Number of keys in the tree
+	BtNodeCount  uint64         // Number of nodes in the tree
+}
 
-	// Create the B-tree
-	tree := &BTree{
-		container: container,
-	}
+// NLoc represents a location within a B-tree node (nloc_t)
+type NLoc struct {
+	Off uint16 // Offset
+	Len uint16 // Length
+}
 
-	// Parse the root node
-	rootNode, err := tree.parseNode(rootNodeData)
+// KVLoc represents the location of a key and value in a B-tree node (kvloc_t)
+type KVLoc struct {
+	K NLoc // Key location
+	V NLoc // Value location
+}
+
+// KVOff represents the offset of a key and value in a B-tree node with fixed sizes (kvoff_t)
+type KVOff struct {
+	K uint16 // Key offset
+	V uint16 // Value offset
+}
+
+// BtnIndexNodeVal represents the value used by hashed B-trees for non-leaf nodes
+type BtnIndexNodeVal struct {
+	BinvChildOID  uint64                     // Object ID of the child node
+	BinvChildHash [BtreeNodeHashSizeMax]byte // Hash of the child node
+}
+
+// NewBTree creates a new B-tree from raw node data
+func NewBTree(container *ContainerManager, data []byte) (*BTree, error) {
+	node := &BTreeNodePhys{}
+	err := node.Parse(data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse B-tree node: %w", err)
 	}
 
-	// Verify that this is a root node
-	if (rootNode.header.BtnFlags & BTNodeRoot) == 0 {
-		return nil, errors.New("not a root node")
-	}
+	// Check if this is a root node
+	isRoot := node.BtnFlags&BtnodeRoot != 0
 
-	tree.rootNode = rootNode
+	// Get tree type and subtype
+	treeType := node.BtnO.GetObjectType()
+	treeSubType := node.BtnO.GetObjectSubtype()
 
-	// Root nodes have B-tree info at the end
-	treeInfo, err := tree.parseTreeInfo(rootNodeData)
-	if err != nil {
-		return nil, err
-	}
-	tree.info = treeInfo
+	// Get tree info for root nodes
+	var nodeSize, keySize, valSize uint32
+	var allowGhosts, isPhysical bool
 
-	// Extract object type and subtype
-	tree.treeType = rootNode.header.BtnO.Type
-	tree.treeSubtype = rootNode.header.BtnO.Subtype
-
-	return tree, nil
-}
-
-// parseNode parses a B-tree node from raw data
-func (bt *BTree) parseNode(data []byte) (*BTreeNode, error) {
-	node := &BTreeNode{
-		tree: bt,
-		data: data,
-	}
-
-	// Parse the node header
-	headerSize := binary.Size(BTreeNodePhys{})
-	if err := binary.Read(bytes.NewReader(data[:headerSize]), binary.LittleEndian, &node.header); err != nil {
-		return nil, err
-	}
-
-	// Verify the checksum
-	if !bt.container.verifyChecksum(data, node.header.BtnO.Checksum[:]) {
-		return nil, ErrInvalidChecksum
-	}
-
-	// Calculate data areas
-	tocOffset := headerSize
-	tocSize := int(node.header.BtnTableSpace.Off)
-	tocEnd := tocOffset + tocSize
-
-	// Table of contents space
-	node.tableSpace = data[tocOffset:tocEnd]
-
-	// Key space starts after the table of contents
-	keySpaceOffset := tocEnd
-	keySpaceSize := int(node.header.BtnFreeSpace.Off)
-	keySpaceEnd := keySpaceOffset + keySpaceSize
-	node.keySpace = data[keySpaceOffset:keySpaceEnd]
-
-	// Value space ends at the end of the node 
-	// (or before the tree info if this is a root node)
-	valueSpaceEnd := len(data)
-	if (node.header.BtnFlags & BTNodeRoot) != 0 {
-		// Root nodes have the tree info at the end
-		valueSpaceEnd -= binary.Size(BTreeInfo{})
-	}
-	valueSpaceSize := int(node.header.BtnFreeSpace.Len)
-	valueSpaceOffset := valueSpaceEnd - valueSpaceSize
-	node.valueSpace = data[valueSpaceOffset:valueSpaceEnd]
-
-	// Parse the table of contents
-	if err := node.parseTableOfContents(); err != nil {
-		return nil, err
-	}
-
-	return node, nil
-}
-
-// parseTableOfContents parses the B-tree node's table of contents
-func (node *BTreeNode) parseTableOfContents() error {
-	isFixedSize := (node.header.BtnFlags & BTNodeFixedKVSize) != 0
-	
-	// Determine number of entries and entry size
-	entryCount := int(node.header.BtnNkeys)
-	node.toc = make([]KVEntry, entryCount)
-
-	if isFixedSize {
-		// Fixed-size keys and values - table of contents has just the offsets
-		entrySize := binary.Size(KVOff{})
-		for i := 0; i < entryCount; i++ {
-			off := KVOff{}
-			err := binary.Read(bytes.NewReader(node.tableSpace[i*entrySize:]), binary.LittleEndian, &off)
-			if err != nil {
-				return err
-			}
-
-			// Get key
-			keyPos := off.K
-			var keyData []byte
-			if i+1 < entryCount {
-				// Get the next key offset to determine length
-				nextOff := KVOff{}
-				binary.Read(bytes.NewReader(node.tableSpace[(i+1)*entrySize:]), binary.LittleEndian, &nextOff)
-				keyData = node.keySpace[keyPos:nextOff.K]
-			} else {
-				// Last key extends to the end of the key space
-				keyData = node.keySpace[keyPos:]
-			}
-
-			// Get value
-			valPos := off.V
-			var valData []byte
-			if i+1 < entryCount {
-				// Get the next value offset to determine length
-				nextOff := KVOff{}
-				binary.Read(bytes.NewReader(node.tableSpace[(i+1)*entrySize:]), binary.LittleEndian, &nextOff)
-				valData = node.valueSpace[valPos:nextOff.V]
-			} else {
-				// Last value extends to the end of the value space
-				valData = node.valueSpace[valPos:]
-			}
-
-			node.toc[i] = KVEntry{
-				Key:    keyData,
-				Value:  valData,
-				KeyPos: keyPos,
-				ValPos: valPos,
-			}
+	if isRoot {
+		// Get B-tree info from the end of the node
+		treeInfo, err := parseBTreeInfo(node.BtnData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse B-tree info: %w", err)
 		}
+
+		nodeSize = treeInfo.BtFixed.BtNodeSize
+		keySize = treeInfo.BtFixed.BtKeySize
+		valSize = treeInfo.BtFixed.BtValSize
+		allowGhosts = treeInfo.BtFixed.BtFlags&BtreeAllowGhosts != 0
+		isPhysical = treeInfo.BtFixed.BtFlags&BtreePhysical != 0
 	} else {
-		// Variable-size keys and values - table of contents has offsets and lengths
-		entrySize := binary.Size(KVLoc{})
-		for i := 0; i < entryCount; i++ {
-			loc := KVLoc{}
-			err := binary.Read(bytes.NewReader(node.tableSpace[i*entrySize:]), binary.LittleEndian, &loc)
-			if err != nil {
-				return err
-			}
+		// For non-root nodes, use the container's block size as node size
+		nodeSize = container.blockSize
 
-			// Get key using offset and length
-			keyPos := loc.K.Off
-			keyLen := loc.K.Len
-			keyData := node.keySpace[keyPos:keyPos+keyLen]
-
-			// Get value using offset and length
-			valPos := loc.V.Off
-			valLen := loc.V.Len
-			valData := node.valueSpace[valPos:valPos+valLen]
-
-			node.toc[i] = KVEntry{
-				Key:    keyData,
-				Value:  valData,
-				KeyPos: keyPos,
-				ValPos: valPos,
-			}
-		}
+		// These will be set by the parent node when traversing
+		keySize = 0
+		valSize = 0
+		allowGhosts = false
+		isPhysical = false
 	}
 
-	return nil
+	// Check for fixed KV sizes
+	fixedKVSize := node.BtnFlags&BtnodeFixedKVSize != 0
+	nodeIsHashed := node.BtnFlags&BtnodeHashed != 0
+
+	return &BTree{
+		container:    container,
+		node:         node,
+		isRoot:       isRoot,
+		nodeSize:     nodeSize,
+		keySize:      keySize,
+		valSize:      valSize,
+		treeType:     treeType,
+		treeSubType:  treeSubType,
+		allowGhosts:  allowGhosts,
+		fixedKVSize:  fixedKVSize,
+		nodeIsHashed: nodeIsHashed,
+		isPhysical:   isPhysical,
+	}, nil
 }
 
-// parseTreeInfo parses the BTreeInfo structure from a root node
-func (bt *BTree) parseTreeInfo(data []byte) (*BTreeInfo, error) {
-	// Tree info is at the end of the root node
-	infoSize := binary.Size(BTreeInfo{})
-	infoOffset := len(data) - infoSize
+// parseBTreeInfo parses the B-tree info from a root node
+func parseBTreeInfo(data []byte) (*BTreeInfo, error) {
+	// B-tree info is at the end of the node
+	if len(data) < binary.Size(BTreeInfo{}) {
+		return nil, ErrStructTooShort
+	}
 
+	offset := len(data) - binary.Size(BTreeInfo{})
 	info := &BTreeInfo{}
-	err := binary.Read(bytes.NewReader(data[infoOffset:]), binary.LittleEndian, info)
+	err := binary.Read(bytes.NewReader(data[offset:]), binary.LittleEndian, info)
 	if err != nil {
 		return nil, err
 	}
@@ -224,286 +157,511 @@ func (bt *BTree) parseTreeInfo(data []byte) (*BTreeInfo, error) {
 	return info, nil
 }
 
-// Search searches the B-tree for a key
-func (bt *BTree) Search(searchKey []byte) ([]byte, error) {
-	// Start at the root node
-	return bt.searchNode(bt.rootNode, searchKey)
-}
-
-// searchNode searches a specific node for a key
-func (bt *BTree) searchNode(node *BTreeNode, searchKey []byte) ([]byte, error) {
-	// Check if this is a leaf node
-	if (node.header.BtnFlags & BTNodeLeaf) != 0 {
-		// This is a leaf node, look for the key directly
-		for _, entry := range node.toc {
-			// Compare keys
-			if bt.compareKeys(entry.Key, searchKey) == 0 {
-				// Key found
-				return entry.Value, nil
-			}
-		}
-		// Key not found in leaf
-		return nil, errors.New("key not found")
+// Parse parses a B-tree node from bytes
+func (node *BTreeNodePhys) Parse(data []byte) error {
+	// Parse the header
+	headerSize := binary.Size(ObjectPhys{})
+	if len(data) < headerSize {
+		return ErrStructTooShort
 	}
 
-	// This is an internal node, find the appropriate child
-	childIndex := bt.findChildIndex(node, searchKey)
-	if childIndex < 0 || childIndex >= len(node.toc) {
-		return nil, errors.New("child index out of range")
-	}
-
-	// Read child node pointer from value
-	var childOID uint64
-	if err := binary.Read(bytes.NewReader(node.toc[childIndex].Value), binary.LittleEndian, &childOID); err != nil {
-		return nil, err
-	}
-
-	// Get child node
-	childNodeData, err := bt.container.resolveObject(childOID, 0) // 0 for current transaction
+	// Parse object header
+	err := node.BtnO.Parse(data[:headerSize])
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	// Parse child node
-	childNode, err := bt.parseNode(childNodeData)
-	if err != nil {
-		return nil, err
+	// Parse fixed node fields
+	if len(data) < headerSize+24 { // 24 = size of remaining fixed fields
+		return ErrStructTooShort
 	}
 
-	// Recursively search the child node
-	return bt.searchNode(childNode, searchKey)
-}
+	node.BtnFlags = binary.LittleEndian.Uint16(data[headerSize:])
+	node.BtnLevel = binary.LittleEndian.Uint16(data[headerSize+2:])
+	node.BtnNKeys = binary.LittleEndian.Uint32(data[headerSize+4:])
 
-// findChildIndex finds the index of the child node that would contain the key
-func (bt *BTree) findChildIndex(node *BTreeNode, searchKey []byte) int {
-	// For an internal node, find the last key that is <= the search key
-	lastIndexLEQ := -1
-	for i, entry := range node.toc {
-		cmp := bt.compareKeys(entry.Key, searchKey)
-		if cmp <= 0 {
-			lastIndexLEQ = i
-		} else {
-			break
+	// Parse the NLoc structures
+	parseNLoc := func(offset int) NLoc {
+		return NLoc{
+			Off: binary.LittleEndian.Uint16(data[offset:]),
+			Len: binary.LittleEndian.Uint16(data[offset+2:]),
 		}
 	}
 
-	// If no key is <= the search key, use the first child
-	if lastIndexLEQ == -1 {
-		return 0
-	}
-	return lastIndexLEQ
-}
+	node.BtnTableSpace = parseNLoc(headerSize + 8)
+	node.BtnFreeSpace = parseNLoc(headerSize + 12)
+	node.BtnKeyFreeList = parseNLoc(headerSize + 16)
+	node.BtnValFreeList = parseNLoc(headerSize + 20)
 
-// compareKeys compares two B-tree keys
-func (bt *BTree) compareKeys(a, b []byte) int {
-	// The comparison depends on the tree subtype
-	switch bt.treeSubtype {
-	case ObjectTypeOMAP:
-		// Object map keys are compared by OID then XID
-		return bt.compareOMapKeys(a, b)
-	case ObjectTypeFSTREE:
-		// File system keys are compared based on their type
-		return bt.compareFSKeys(a, b)
-	default:
-		// Default to byte-by-byte comparison
-		return bytes.Compare(a, b)
-	}
-}
-
-// compareOMapKeys compares two object map keys
-func (bt *BTree) compareOMapKeys(a, b []byte) int {
-	var keyA, keyB OMapKey
-	if err := binary.Read(bytes.NewReader(a), binary.LittleEndian, &keyA); err != nil {
-		return 0
-	}
-	if err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &keyB); err != nil {
-		return 0
-	}
-
-	// Compare OIDs
-	if keyA.OkOID < keyB.OkOID {
-		return -1
-	} else if keyA.OkOID > keyB.OkOID {
-		return 1
-	}
-
-	// OIDs are equal, compare XIDs
-	if keyA.OkXID < keyB.OkXID {
-		return -1
-	} else if keyA.OkXID > keyB.OkXID {
-		return 1
-	}
-
-	// Keys are equal
-	return 0
-}
-
-// compareFSKeys compares two file system keys
-func (bt *BTree) compareFSKeys(a, b []byte) int {
-	// Read the object ID and type from the keys
-	var keyHeaderA, keyHeaderB JKey
-	if err := binary.Read(bytes.NewReader(a), binary.LittleEndian, &keyHeaderA); err != nil {
-		return 0
-	}
-	if err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &keyHeaderB); err != nil {
-		return 0
-	}
-
-	// Extract object ID (removing the type bits)
-	objIDA := keyHeaderA.ObjIDAndType & ObjIDMask
-	objIDB := keyHeaderB.ObjIDAndType & ObjIDMask
-
-	// Compare object IDs
-	if objIDA < objIDB {
-		return -1
-	} else if objIDA > objIDB {
-		return 1
-	}
-
-	// Object IDs are equal, compare types
-	typeA := (keyHeaderA.ObjIDAndType & ObjTypeMask) >> ObjTypeShift
-	typeB := (keyHeaderB.ObjIDAndType & ObjTypeMask) >> ObjTypeShift
-
-	if typeA < typeB {
-		return -1
-	} else if typeA > typeB {
-		return 1
-	}
-
-	// For certain types, we need to compare additional fields
-	if typeA == APFSTypeDirRec || typeA == APFSTypeXattr {
-		// Directory entries and xattrs have name fields
-		// Skip the common header and compare the names
-		return bt.compareNames(a[binary.Size(JKey{}):], b[binary.Size(JKey{}):])
-	}
-
-	// Types are equal and no additional comparison needed
-	return 0
-}
-
-// compareNames compares two names from directory entries or xattrs
-func (bt *BTree) compareNames(a, b []byte) int {
-	// Read name lengths
-	var lenA, lenB uint16
-	if err := binary.Read(bytes.NewReader(a), binary.LittleEndian, &lenA); err != nil {
-		return 0
-	}
-	if err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &lenB); err != nil {
-		return 0
-	}
-
-	// Extract names
-	nameA := a[2:2+lenA]
-	nameB := b[2:2+lenB]
-
-	// Compare names
-	return bytes.Compare(nameA, nameB)
-}
-
-// Iterate calls the given function for each key-value pair in the B-tree
-func (bt *BTree) Iterate(fn func(key, value []byte) bool) error {
-	return bt.iterateNode(bt.rootNode, fn)
-}
-
-// iterateNode iterates through a B-tree node and its children
-func (bt *BTree) iterateNode(node *BTreeNode, fn func(key, value []byte) bool) error {
-	if (node.header.BtnFlags & BTNodeLeaf) != 0 {
-		// Leaf node - process all key-value pairs
-		for _, entry := range node.toc {
-			if !fn(entry.Key, entry.Value) {
-				return nil // Iteration stopped by callback
-			}
-		}
-		return nil
-	}
-
-	// Internal node - recurse into children
-	for _, entry := range node.toc {
-		// Read child node pointer from value
-		var childOID uint64
-		if err := binary.Read(bytes.NewReader(entry.Value), binary.LittleEndian, &childOID); err != nil {
-			return err
-		}
-
-		// Get child node
-		childNodeData, err := bt.container.resolveObject(childOID, 0) // 0 for current transaction
-		if err != nil {
-			return err
-		}
-
-		// Parse child node
-		childNode, err := bt.parseNode(childNodeData)
-		if err != nil {
-			return err
-		}
-
-		// Recursively iterate the child node
-		if err := bt.iterateNode(childNode, fn); err != nil {
-			return err
-		}
-	}
+	// Store the node data
+	node.BtnData = make([]byte, len(data)-headerSize-24)
+	copy(node.BtnData, data[headerSize+24:])
 
 	return nil
 }
 
-// IterateRange iterates through keys in a specific range
-func (bt *BTree) IterateRange(startKey, endKey []byte, fn func(key, value []byte) bool) error {
-	return bt.iterateNodeRange(bt.rootNode, startKey, endKey, fn)
+// Serialize converts the B-tree node to bytes
+func (node *BTreeNodePhys) Serialize() ([]byte, error) {
+	// Calculate total size
+	headerSize := binary.Size(ObjectPhys{})
+	fixedSize := headerSize + 24 // 24 = size of remaining fixed fields
+	totalSize := fixedSize + len(node.BtnData)
+
+	// Create buffer
+	buf := make([]byte, totalSize)
+
+	// Serialize object header
+	objBytes, err := node.BtnO.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	copy(buf[:headerSize], objBytes)
+
+	// Serialize fixed node fields
+	binary.LittleEndian.PutUint16(buf[headerSize:], node.BtnFlags)
+	binary.LittleEndian.PutUint16(buf[headerSize+2:], node.BtnLevel)
+	binary.LittleEndian.PutUint32(buf[headerSize+4:], node.BtnNKeys)
+
+	// Serialize NLoc structures
+	writeNLoc := func(loc NLoc, offset int) {
+		binary.LittleEndian.PutUint16(buf[offset:], loc.Off)
+		binary.LittleEndian.PutUint16(buf[offset+2:], loc.Len)
+	}
+
+	writeNLoc(node.BtnTableSpace, headerSize+8)
+	writeNLoc(node.BtnFreeSpace, headerSize+12)
+	writeNLoc(node.BtnKeyFreeList, headerSize+16)
+	writeNLoc(node.BtnValFreeList, headerSize+20)
+
+	// Copy node data
+	copy(buf[fixedSize:], node.BtnData)
+
+	// Calculate and set checksum
+	node.BtnO.SetChecksum(buf)
+	objBytes, err = node.BtnO.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	copy(buf[:headerSize], objBytes)
+
+	return buf, nil
 }
 
-// iterateNodeRange iterates through a range of keys in a B-tree node and its children
-func (bt *BTree) iterateNodeRange(node *BTreeNode, startKey, endKey []byte, fn func(key, value []byte) bool) error {
-	if (node.header.BtnFlags & BTNodeLeaf) != 0 {
-		// Leaf node - process key-value pairs in range
-		for _, entry := range node.toc {
-			// Skip keys less than startKey
-			if startKey != nil && bt.compareKeys(entry.Key, startKey) < 0 {
-				continue
+// IsLeaf returns true if this is a leaf node
+func (node *BTreeNodePhys) IsLeaf() bool {
+	return node.BtnFlags&BtnodeLeaf != 0
+}
+
+// GetTOC returns the table of contents entries for a node
+func (bt *BTree) GetTOC() ([]KVLoc, []KVOff, error) {
+	node := bt.node
+
+	// Get the start and length of the table of contents
+	tocOff := node.BtnTableSpace.Off
+	tocLen := node.BtnTableSpace.Len
+
+	if tocLen == 0 {
+		return nil, nil, nil
+	}
+
+	if bt.fixedKVSize {
+		// Fixed size keys and values
+		entriesCount := tocLen / 4 // Each KVOff is 4 bytes
+		tocData := node.BtnData[tocOff : tocOff+tocLen]
+
+		toc := make([]KVOff, entriesCount)
+		for i := uint16(0); i < uint16(entriesCount); i++ {
+			toc[i] = KVOff{
+				K: binary.LittleEndian.Uint16(tocData[i*4:]),
+				V: binary.LittleEndian.Uint16(tocData[i*4+2:]),
 			}
-			// Stop at keys greater than endKey
-			if endKey != nil && bt.compareKeys(entry.Key, endKey) > 0 {
+		}
+		return nil, toc, nil
+	} else {
+		// Variable size keys and values
+		entriesCount := tocLen / 8 // Each KVLoc is 8 bytes
+		tocData := node.BtnData[tocOff : tocOff+tocLen]
+
+		toc := make([]KVLoc, entriesCount)
+		for i := uint16(0); i < uint16(entriesCount); i++ {
+			toc[i] = KVLoc{
+				K: NLoc{
+					Off: binary.LittleEndian.Uint16(tocData[i*8:]),
+					Len: binary.LittleEndian.Uint16(tocData[i*8+2:]),
+				},
+				V: NLoc{
+					Off: binary.LittleEndian.Uint16(tocData[i*8+4:]),
+					Len: binary.LittleEndian.Uint16(tocData[i*8+6:]),
+				},
+			}
+		}
+		return toc, nil, nil
+	}
+}
+
+// GetKey returns the key at the specified index
+func (bt *BTree) GetKey(index uint32) ([]byte, error) {
+	if index >= bt.node.BtnNKeys {
+		return nil, fmt.Errorf("key index %d out of range (0-%d)", index, bt.node.BtnNKeys-1)
+	}
+
+	// Get the table of contents
+	kvloc, kvoff, err := bt.GetTOC()
+	if err != nil {
+		return nil, err
+	}
+
+	var keyOff, keyLen uint16
+
+	if bt.fixedKVSize {
+		// Fixed size keys
+		keyOff = kvoff[index].K
+		keyLen = bt.keySize
+	} else {
+		// Variable size keys
+		keyOff = kvloc[index].K.Off
+		keyLen = kvloc[index].K.Len
+	}
+
+	// Calculate the actual offset from the end of the table space
+	tocEnd := bt.node.BtnTableSpace.Off + bt.node.BtnTableSpace.Len
+
+	// Get the key data
+	keyOff += tocEnd // Keys start after the TOC
+	if int(keyOff+keyLen) > len(bt.node.BtnData) {
+		return nil, fmt.Errorf("key at index %d extends beyond node data", index)
+	}
+
+	return bt.node.BtnData[keyOff : keyOff+keyLen], nil
+}
+
+// GetValue returns the value at the specified index
+func (bt *BTree) GetValue(index uint32) ([]byte, error) {
+	if index >= bt.node.BtnNKeys {
+		return nil, fmt.Errorf("value index %d out of range (0-%d)", index, bt.node.BtnNKeys-1)
+	}
+
+	// Get the table of contents
+	kvloc, kvoff, err := bt.GetTOC()
+	if err != nil {
+		return nil, err
+	}
+
+	var valOff, valLen uint16
+	var isGhost bool
+
+	if bt.fixedKVSize {
+		// Fixed size values
+		valOff = kvoff[index].V
+		valLen = bt.valSize
+		isGhost = valOff == BtoffInvalid
+	} else {
+		// Variable size values
+		valOff = kvloc[index].V.Off
+		valLen = kvloc[index].V.Len
+		isGhost = valOff == BtoffInvalid
+	}
+
+	// Check if this is a ghost key (has no value)
+	if isGhost {
+		if bt.allowGhosts {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("unexpected ghost value at index %d", index)
+	}
+
+	// Values are stored from the end of the node data
+	valueOffset := uint16(len(bt.node.BtnData)) - valOff
+	if int(valueOffset+valLen) > len(bt.node.BtnData) {
+		return nil, fmt.Errorf("value at index %d extends beyond node data", index)
+	}
+
+	return bt.node.BtnData[valueOffset : valueOffset+valLen], nil
+}
+
+// Search searches for a key in the B-tree
+func (bt *BTree) Search(key []byte) ([]byte, error) {
+	return bt.search(key, bt.node, bt.isRoot)
+}
+
+// search performs the actual search on a B-tree node
+func (bt *BTree) search(key []byte, node *BTreeNodePhys, isRoot bool) ([]byte, error) {
+	// Check if this is a leaf node
+	if node.IsLeaf() {
+		// Find the key in this leaf node
+		index, found, err := bt.findKey(node, key)
+		if err != nil {
+			return nil, err
+		}
+
+		if !found {
+			return nil, ErrNotFound
+		}
+
+		// Get the value for this key
+		return bt.GetValue(index)
+	}
+
+	// This is a non-leaf node, find the child node to search
+	index, found, err := bt.findKey(node, key)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the key was found exactly, use that child
+	// If not found, use the child that would be just before it
+	if !found && index > 0 {
+		index--
+	}
+
+	// Get the child node's object ID
+	valueBytes, err := bt.GetValue(index)
+	if err != nil {
+		return nil, err
+	}
+
+	var childOID uint64
+	if bt.nodeIsHashed {
+		// The value is a BtnIndexNodeVal with the child OID and hash
+		if len(valueBytes) < binary.Size(uint64(0)) {
+			return nil, ErrStructTooShort
+		}
+		childOID = binary.LittleEndian.Uint64(valueBytes)
+	} else {
+		// The value is just the child OID
+		if len(valueBytes) < binary.Size(uint64(0)) {
+			return nil, ErrStructTooShort
+		}
+		childOID = binary.LittleEndian.Uint64(valueBytes)
+	}
+
+	// Get latest transaction ID
+	xid := bt.container.checkpoint.XID
+
+	// Resolve the child node
+	var childData []byte
+	if bt.isPhysical {
+		// Physical address
+		childData, err = bt.container.readPhysicalObject(childOID)
+	} else {
+		// Virtual object
+		childData, err = bt.container.resolveObject(childOID, xid)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve child node: %w", err)
+	}
+
+	// Parse the child node
+	childNode := &BTreeNodePhys{}
+	err = childNode.Parse(childData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse child node: %w", err)
+	}
+
+	// Search in the child node
+	return bt.search(key, childNode, false)
+}
+
+// findKey finds a key in a B-tree node
+// Returns the index, a boolean indicating if the key was found, and any error
+func (bt *BTree) findKey(node *BTreeNodePhys, key []byte) (uint32, bool, error) {
+	// Binary search for the key
+	left := uint32(0)
+	right := node.BtnNKeys - 1
+
+	// Special case for empty node
+	if node.BtnNKeys == 0 {
+		return 0, false, nil
+	}
+
+	// Temporary BTree struct for the current node
+	nodeBt := &BTree{
+		container:   bt.container,
+		node:        node,
+		isRoot:      false,
+		nodeSize:    bt.nodeSize,
+		keySize:     bt.keySize,
+		valSize:     bt.valSize,
+		fixedKVSize: node.BtnFlags&BtnodeFixedKVSize != 0,
+		allowGhosts: bt.allowGhosts,
+	}
+
+	for left <= right {
+		mid := (left + right) / 2
+
+		// Get the key at this index
+		midKey, err := nodeBt.GetKey(mid)
+		if err != nil {
+			return 0, false, err
+		}
+
+		// Compare keys
+		cmp := bytes.Compare(midKey, key)
+
+		if cmp == 0 {
+			// Found the key
+			return mid, true, nil
+		} else if cmp < 0 {
+			// Key is in right half
+			left = mid + 1
+		} else {
+			// Key is in left half
+			if mid == 0 {
+				break
+			}
+			right = mid - 1
+		}
+	}
+
+	// Key not found
+	return left, false, nil
+}
+
+// IterateRange iterates over a range of keys in the B-tree
+func (bt *BTree) IterateRange(startKey, endKey []byte, callback func(key, value []byte) bool) error {
+	// Start by finding the leaf node that would contain the start key
+	return bt.iterateRange(bt.node, startKey, endKey, callback)
+}
+
+// iterateRange performs the actual iteration on a B-tree node
+func (bt *BTree) iterateRange(node *BTreeNodePhys, startKey, endKey []byte, callback func(key, value []byte) bool) error {
+	// If this is a leaf node, iterate through its keys
+	if node.IsLeaf() {
+		// Create temporary BTree for this node
+		nodeBt := &BTree{
+			container:   bt.container,
+			node:        node,
+			isRoot:      false,
+			nodeSize:    bt.nodeSize,
+			keySize:     bt.keySize,
+			valSize:     bt.valSize,
+			fixedKVSize: node.BtnFlags&BtnodeFixedKVSize != 0,
+			allowGhosts: bt.allowGhosts,
+		}
+
+		// Find the starting position
+		startIndex, _, err := bt.findKey(node, startKey)
+		if err != nil {
+			return err
+		}
+
+		// Iterate through keys
+		for i := startIndex; i < node.BtnNKeys; i++ {
+			key, err := nodeBt.GetKey(i)
+			if err != nil {
+				return err
+			}
+
+			// If we've gone past the end key, stop iterating
+			if endKey != nil && bytes.Compare(key, endKey) > 0 {
+				break
+			}
+
+			// Get the value
+			value, err := nodeBt.GetValue(i)
+			if err != nil {
+				return err
+			}
+
+			// Call the callback
+			if !callback(key, value) {
+				// Callback returned false, stop iterating
 				return nil
 			}
-			
-			if !fn(entry.Key, entry.Value) {
-				return nil // Iteration stopped by callback
-			}
 		}
+
+		// Done with this leaf
 		return nil
 	}
 
-	// Internal node - find relevant children and recurse
-	for i, entry := range node.toc {
-		// Skip children whose key range is entirely before startKey
-		if i+1 < len(node.toc) && startKey != nil && bt.compareKeys(node.toc[i+1].Key, startKey) <= 0 {
-			continue
-		}
-		
-		// Stop at children whose key range is entirely after endKey
-		if endKey != nil && bt.compareKeys(entry.Key, endKey) > 0 {
-			return nil
+	// This is a non-leaf node
+	// Find the child node that would contain the start key
+	startIndex, _, err := bt.findKey(node, startKey)
+	if err != nil {
+		return err
+	}
+
+	// If the key was not found and we're not at the beginning, go to the previous child
+	if startIndex > 0 {
+		startIndex--
+	}
+
+	// Create temporary BTree for this node
+	nodeBt := &BTree{
+		container:    bt.container,
+		node:         node,
+		isRoot:       false,
+		nodeSize:     bt.nodeSize,
+		keySize:      bt.keySize,
+		valSize:      bt.valSize,
+		fixedKVSize:  node.BtnFlags&BtnodeFixedKVSize != 0,
+		allowGhosts:  bt.allowGhosts,
+		nodeIsHashed: node.BtnFlags&BtnodeHashed != 0,
+		isPhysical:   bt.isPhysical,
+	}
+
+	// Iterate through child nodes
+	for i := startIndex; i < node.BtnNKeys; i++ {
+		// Get the key at this index
+		key, err := nodeBt.GetKey(i)
+		if err != nil {
+			return err
 		}
 
-		// Read child node pointer from value
+		// If we've gone past the end key, stop iterating
+		if endKey != nil && bytes.Compare(key, endKey) > 0 {
+			break
+		}
+
+		// Get the child node object ID
+		valueBytes, err := nodeBt.GetValue(i)
+		if err != nil {
+			return err
+		}
+
 		var childOID uint64
-		if err := binary.Read(bytes.NewReader(entry.Value), binary.LittleEndian, &childOID); err != nil {
-			return err
+		if nodeBt.nodeIsHashed {
+			// The value is a BtnIndexNodeVal with the child OID and hash
+			if len(valueBytes) < binary.Size(uint64(0)) {
+				return ErrStructTooShort
+			}
+			childOID = binary.LittleEndian.Uint64(valueBytes)
+		} else {
+			// The value is just the child OID
+			if len(valueBytes) < binary.Size(uint64(0)) {
+				return ErrStructTooShort
+			}
+			childOID = binary.LittleEndian.Uint64(valueBytes)
 		}
 
-		// Get child node
-		childNodeData, err := bt.container.resolveObject(childOID, 0) // 0 for current transaction
+		// Get latest transaction ID
+		xid := bt.container.checkpoint.XID
+
+		// Resolve the child node
+		var childData []byte
+		if bt.isPhysical {
+			// Physical address
+			childData, err = bt.container.readPhysicalObject(childOID)
+		} else {
+			// Virtual object
+			childData, err = bt.container.resolveObject(childOID, xid)
+		}
+
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to resolve child node: %w", err)
 		}
 
-		// Parse child node
-		childNode, err := bt.parseNode(childNodeData)
+		// Parse the child node
+		childNode := &BTreeNodePhys{}
+		err = childNode.Parse(childData)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to parse child node: %w", err)
 		}
 
-		// Recursively iterate the child node
-		if err := bt.iterateNodeRange(childNode, startKey, endKey, fn); err != nil {
+		// Recursively iterate through the child node
+		err = bt.iterateRange(childNode, startKey, endKey, callback)
+		if err != nil {
 			return err
 		}
 	}
@@ -511,32 +669,39 @@ func (bt *BTree) iterateNodeRange(node *BTreeNode, startKey, endKey []byte, fn f
 	return nil
 }
 
-// GetTreeInfo returns information about the B-tree
-func (bt *BTree) GetTreeInfo() BTreeInfo {
-	return *bt.info
+// Insert inserts a key-value pair into the B-tree
+func (bt *BTree) Insert(tx *Transaction, key, value []byte) error {
+	// Check if transaction is valid
+	if tx == nil || tx.completed {
+		return errors.New("invalid transaction")
+	}
+
+	// Need to implement transaction logic, node splitting, etc.
+	return ErrNotImplemented
 }
 
-// GetNodeCount returns the number of nodes in the B-tree
-func (bt *BTree) GetNodeCount() uint64 {
-	return bt.info.BtNodeCount
+// Delete deletes a key from the B-tree
+func (bt *BTree) Delete(tx *Transaction, key []byte) error {
+	// Check if transaction is valid
+	if tx == nil || tx.completed {
+		return errors.New("invalid transaction")
+	}
+
+	// Need to implement transaction logic, node merging, etc.
+	return ErrNotImplemented
 }
 
-// GetKeyCount returns the number of keys in the B-tree
-func (bt *BTree) GetKeyCount() uint64 {
-	return bt.info.BtKeyCount
+// GetBTreeInfo returns the B-tree's info (for root nodes)
+func (bt *BTree) GetBTreeInfo() (*BTreeInfo, error) {
+	if !bt.isRoot {
+		return nil, errors.New("not a root node")
+	}
+
+	// Parse the B-tree info from the end of the node
+	return parseBTreeInfo(bt.node.BtnData)
 }
 
-// IsFixedKV returns true if the B-tree uses fixed-size keys and values
-func (bt *BTree) IsFixedKV() bool {
-	return bt.info.BtFixed.BtKeySize > 0 && bt.info.BtFixed.BtValSize > 0
-}
-
-// GetTreeType returns the B-tree's type
-func (bt *BTree) GetTreeType() uint32 {
-	return bt.treeType
-}
-
-// GetTreeSubtype returns the B-tree's subtype
-func (bt *BTree) GetTreeSubtype() uint32 {
-	return bt.treeSubtype
+// GetNodeLevel returns the B-tree node's level
+func (bt *BTree) GetNodeLevel() uint16 {
+	return bt.node.BtnLevel
 }
