@@ -7,7 +7,7 @@ require (
 	github.com/dsnet/compress v0.0.1
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.20.0
-	github.com/ulikunitz/xz v0.5.6
+	github.com/ulikunitz/xz v0.5.12
 	go.uber.org/zap v1.27.0
 	howett.net/plist v1.0.1
 )
