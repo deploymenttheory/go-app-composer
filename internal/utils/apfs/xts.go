@@ -1,9 +1,11 @@
-//
+
 package apfs
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,8 +13,14 @@ import (
 	"golang.org/x/crypto/xts"
 )
 
-// NewAESXTSCipher creates a new AES-XTS cipher using the golang.org/x/crypto/xts package
-func NewAESXTSCipher(key []byte) (cipher.BlockMode, error) {
+// AESXTSCipher implements AES-XTS encryption/decryption using Go's crypto libraries
+type AESXTSCipher struct {
+	cipher cipher.BlockMode
+	blockSize int
+}
+
+// NewAESXTSCipher creates a new AES-XTS cipher
+func NewAESXTSCipher(key []byte) (*AESXTSCipher, error) {
 	// AES-XTS requires two keys of equal length
 	if len(key) != 32 && len(key) != 48 && len(key) != 64 {
 		return nil, errors.New("AES-XTS key must be 256, 384 or 512 bits (two AES keys)")
@@ -33,60 +41,55 @@ func NewAESXTSCipher(key []byte) (cipher.BlockMode, error) {
 	}
 	
 	// Create XTS cipher with the two keys
-	xtsMode, err := xts.NewCipher(c1, c2)
+	xtsCipher, err := xts.NewCipher(c1, c2)
 	if err != nil {
 		return nil, err
 	}
 	
-	return xtsMode, nil
+	return &AESXTSCipher{
+		cipher: xtsCipher,
+		blockSize: 16, // AES block size is always 16 bytes
+	}, nil
 }
 
-// EncryptBlock encrypts a block of data using AES-XTS
-func EncryptBlock(data []byte, physBlockNum, cryptoID uint64, key []byte) ([]byte, error) {
-	if len(data)%16 != 0 {
-		return nil, errors.New("input length must be a multiple of the block size (16 bytes)")
+// Encrypt encrypts data using AES-XTS
+func (c *AESXTSCipher) Encrypt(dst, src []byte, tweak []byte) error {
+	if len(dst) < len(src) {
+		return errors.New("output buffer too small")
 	}
 	
-	// Create the XTS cipher
-	cipher, err := NewAESXTSCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create AES-XTS cipher: %w", err)
+	if len(src) == 0 || len(src)%c.blockSize != 0 {
+		return errors.New("input length must be a multiple of the block size")
 	}
 	
-	// Create tweak value from the crypto ID and block number
-	tweak := make([]byte, 16)
-	binary.LittleEndian.PutUint64(tweak, cryptoID)
-	binary.LittleEndian.PutUint64(tweak[8:], physBlockNum)
+	if len(tweak) < c.blockSize {
+		return errors.New("tweak must be at least block size bytes")
+	}
 	
-	// Encrypt the data
-	encrypted := make([]byte, len(data))
-	cipher.Encrypt(encrypted, data, tweak)
+	// Use the XTS cipher to encrypt the data
+	c.cipher.Encrypt(dst, src, tweak[:16])
 	
-	return encrypted, nil
+	return nil
 }
 
-// DecryptBlock decrypts a block of data using AES-XTS
-func DecryptBlock(data []byte, physBlockNum, cryptoID uint64, key []byte) ([]byte, error) {
-	if len(data)%16 != 0 {
-		return nil, errors.New("input length must be a multiple of the block size (16 bytes)")
+// Decrypt decrypts data using AES-XTS
+func (c *AESXTSCipher) Decrypt(dst, src []byte, tweak []byte) error {
+	if len(dst) < len(src) {
+		return errors.New("output buffer too small")
 	}
 	
-	// Create the XTS cipher
-	cipher, err := NewAESXTSCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create AES-XTS cipher: %w", err)
+	if len(src) == 0 || len(src)%c.blockSize != 0 {
+		return errors.New("input length must be a multiple of the block size")
 	}
 	
-	// Create tweak value from the crypto ID and block number
-	tweak := make([]byte, 16)
-	binary.LittleEndian.PutUint64(tweak, cryptoID)
-	binary.LittleEndian.PutUint64(tweak[8:], physBlockNum)
+	if len(tweak) < c.blockSize {
+		return errors.New("tweak must be at least block size bytes")
+	}
 	
-	// Decrypt the data
-	decrypted := make([]byte, len(data))
-	cipher.Decrypt(decrypted, data, tweak)
+	// Use the XTS cipher to decrypt the data
+	c.cipher.Decrypt(dst, src, tweak[:16])
 	
-	return decrypted, nil
+	return nil
 }
 
 // UnwrapKey unwraps a key using AES key wrapping (RFC 3394)
@@ -155,7 +158,7 @@ func UnwrapKey(wrappingKey, wrappedKey []byte) ([]byte, error) {
 	// Check integrity - RFC 3394 uses a fixed Initial Value (IV)
 	// The standard IV is 0xA6A6A6A6A6A6A6A6
 	fixedIV := []byte{0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6}
-	if !byteArrayEqual(A, fixedIV) {
+	if !bytes.Equal(A, fixedIV) {
 		return nil, errors.New("key unwrapping integrity check failed")
 	}
 	
@@ -168,82 +171,137 @@ func UnwrapKey(wrappingKey, wrappedKey []byte) ([]byte, error) {
 	return unwrappedKey, nil
 }
 
-// WrapKey wraps a key using AES key wrapping (RFC 3394)
-func WrapKey(wrappingKey, keyToWrap []byte) ([]byte, error) {
-	if len(wrappingKey) != 16 && len(wrappingKey) != 24 && len(wrappingKey) != 32 {
-		return nil, errors.New("invalid wrapping key size")
-	}
-	
-	// Ensure the input key length is a multiple of 8 bytes
-	if len(keyToWrap) == 0 || len(keyToWrap)%8 != 0 {
-		return nil, errors.New("key to wrap must be a multiple of 8 bytes")
-	}
-	
-	// Create AES cipher with wrapping key
-	c, err := aes.NewCipher(wrappingKey)
-	if err != nil {
-		return nil, err
-	}
-	
-	// RFC 3394 key wrapping
-	n := len(keyToWrap) / 8
-	
-	// Initialize variables
-	A := []byte{0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6} // Initial value
-	
-	// Set up the R array - blocks of plaintext
-	R := make([][]byte, n)
-	for i := 0; i < n; i++ {
-		R[i] = make([]byte, 8)
-		copy(R[i], keyToWrap[i*8:(i+1)*8])
-	}
-	
-	// Wrapping process
-	for j := 0; j <= 5; j++ {
-		for i := 1; i <= n; i++ {
-			// Concatenate A and R[i]
-			block := make([]byte, 16)
-			copy(block[:8], A)
-			copy(block[8:], R[i-1])
-			
-			// AES encrypt
-			output := make([]byte, 16)
-			c.Encrypt(output, block)
-			
-			// Calculate t value
-			t := uint64(n*j + i)
-			
-			// Extract new A and R[i] values
-			copy(A, output[:8])
-			
-			// XOR A with t
-			value := binary.BigEndian.Uint64(A)
-			value ^= t
-			binary.BigEndian.PutUint64(A, value)
-			
-			copy(R[i-1], output[8:])
-		}
-	}
-	
-	// Assemble final output
-	wrappedKey := make([]byte, (n+1)*8)
-	copy(wrappedKey[:8], A)
-	for i := 0; i < n; i++ {
-		copy(wrappedKey[8*(i+1):8*(i+2)], R[i])
-	}
-	
-	return wrappedKey, nil
+// EncryptionContext manages encryption/decryption operations
+type EncryptionContext struct {
+	containerUUID        [16]byte
+	volumeUUID           [16]byte
+	volumeEncryptionKey  []byte
+	usesSoftwareEncryption bool
+	isDecrypted          bool
 }
 
-// byteArrayEqual compares two byte arrays
-func byteArrayEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+// NewEncryptionContext creates a new encryption context
+func NewEncryptionContext(volumeUUID, containerUUID [16]byte) *EncryptionContext {
+	return &EncryptionContext{
+		volumeUUID:            volumeUUID,
+		containerUUID:         containerUUID,
+		usesSoftwareEncryption: true,
+		isDecrypted:           false,
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+}
+
+// IsDecrypted returns whether the volume has been decrypted
+func (ec *EncryptionContext) IsDecrypted() bool {
+	return ec.isDecrypted
+}
+
+// SetVolumeEncryptionKey sets the volume encryption key
+func (ec *EncryptionContext) SetVolumeEncryptionKey(key []byte) {
+	ec.volumeEncryptionKey = key
+	ec.isDecrypted = true
+}
+
+// UnlockWithPassword unlocks the volume with a password
+func (ec *EncryptionContext) UnlockWithPassword(password string, containerKeybag, volumeKeybag *KBLocker) error {
+	if containerKeybag == nil || volumeKeybag == nil {
+		return errors.New("keybags are required for unlocking")
+	}
+	
+	// Find the volume key entry in the container keybag
+	volumeKeyEntry := containerKeybag.FindEntry(ec.volumeUUID, KBTagVolumeKey)
+	if volumeKeyEntry == nil {
+		return errors.New("volume key not found in container keybag")
+	}
+	
+	// Find the user's KEK in the volume keybag
+	var kekEntry *KeybagEntry
+	for i := range volumeKeybag.Entries {
+		if volumeKeybag.Entries[i].Tag == KBTagVolumeUnlockRecords {
+			kekEntry = &volumeKeybag.Entries[i]
+			break
 		}
 	}
-	return true
+	
+	if kekEntry == nil {
+		return errors.New("no unlock records found in volume keybag")
+	}
+	
+	// Derive a key from the password using SHA-256
+	// In a real implementation, this would use PBKDF2 with salt and iterations
+	passDerivedKey := make([]byte, 32)
+	h := sha256.New()
+	h.Write([]byte(password))
+	copy(passDerivedKey, h.Sum(nil))
+	
+	// Use the derived key to unwrap the KEK
+	kek, err := UnwrapKey(passDerivedKey, kekEntry.KeyData)
+	if err != nil {
+		return fmt.Errorf("failed to unwrap KEK: %w", err)
+	}
+	
+	// Use the KEK to unwrap the VEK
+	vek, err := UnwrapKey(kek, volumeKeyEntry.KeyData)
+	if err != nil {
+		return fmt.Errorf("failed to unwrap VEK: %w", err)
+	}
+	
+	// Store the VEK in the encryption context
+	ec.volumeEncryptionKey = vek
+	ec.isDecrypted = true
+	
+	return nil
+}
+
+// DecryptBlock decrypts a block of data using AES-XTS
+func (ec *EncryptionContext) DecryptBlock(data []byte, physBlockNum, cryptoID uint64) ([]byte, error) {
+	if !ec.isDecrypted {
+		return nil, errors.New("volume not decrypted")
+	}
+	
+	// Create the XTS cipher with VEK
+	cipher, err := NewAESXTSCipher(ec.volumeEncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES-XTS cipher: %w", err)
+	}
+	
+	// Create tweak value from the crypto ID and block number
+	tweak := make([]byte, 16)
+	binary.LittleEndian.PutUint64(tweak, cryptoID)
+	binary.LittleEndian.PutUint64(tweak[8:], physBlockNum)
+	
+	// Decrypt the data
+	decrypted := make([]byte, len(data))
+	err = cipher.Decrypt(decrypted, data, tweak)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt block: %w", err)
+	}
+	
+	return decrypted, nil
+}
+
+// EncryptBlock encrypts a block of data using AES-XTS
+func (ec *EncryptionContext) EncryptBlock(data []byte, physBlockNum, cryptoID uint64) ([]byte, error) {
+	if !ec.isDecrypted {
+		return nil, errors.New("volume not decrypted")
+	}
+	
+	// Create the XTS cipher with VEK
+	cipher, err := NewAESXTSCipher(ec.volumeEncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES-XTS cipher: %w", err)
+	}
+	
+	// Create tweak value from the crypto ID and block number
+	tweak := make([]byte, 16)
+	binary.LittleEndian.PutUint64(tweak, cryptoID)
+	binary.LittleEndian.PutUint64(tweak[8:], physBlockNum)
+	
+	// Encrypt the data
+	encrypted := make([]byte, len(data))
+	err = cipher.Encrypt(encrypted, data, tweak)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt block: %w", err)
+	}
+	
+	return encrypted, nil
 }
