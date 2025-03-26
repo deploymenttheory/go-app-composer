@@ -17,7 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/yourusername/fsutil"
+	"github.com/deploymenttheory/go-app-composer/internal/utils/fsutil"
 )
 
 const (
@@ -74,22 +74,22 @@ type KolyTrailer struct {
 
 // MishHeader represents the block metadata for a partition
 type MishHeader struct {
-	Signature          uint32
-	Version            uint32
-	SectorNumber       uint64
-	SectorCount        uint64
-	DataOffset         uint64
-	BuffersNeeded      uint32
-	BlockDescriptors   uint32
-	Reserved1          uint32
-	Reserved2          uint32
-	Reserved3          uint32
-	Reserved4          uint32
-	Reserved5          uint32
-	Reserved6          uint32
-	ChecksumType       uint32
-	ChecksumSize       uint32
-	Checksum           [32]uint32
+	Signature           uint32
+	Version             uint32
+	SectorNumber        uint64
+	SectorCount         uint64
+	DataOffset          uint64
+	BuffersNeeded       uint32
+	BlockDescriptors    uint32
+	Reserved1           uint32
+	Reserved2           uint32
+	Reserved3           uint32
+	Reserved4           uint32
+	Reserved5           uint32
+	Reserved6           uint32
+	ChecksumType        uint32
+	ChecksumSize        uint32
+	Checksum            [32]uint32
 	NumberOfBlockChunks uint32
 }
 
@@ -130,7 +130,7 @@ type XMLPropertyList struct {
 
 // DMGReader represents a DMG file reader
 type DMGReader struct {
-	file       *os.File
+	file        *os.File
 	kolyTrailer KolyTrailer
 	xmlPlist    []byte
 	partitions  []DMGPartition
@@ -323,13 +323,13 @@ func (r *DMGReader) ExtractPartition(partitionIndex int, outputPath string) erro
 	}
 
 	partition := r.partitions[partitionIndex]
-	
+
 	// Create output directory if it doesn't exist
 	outputDir := filepath.Dir(outputPath)
 	if err := fsutil.CreateDirIfNotExists(outputDir); err != nil {
 		return fmt.Errorf("failed to create output directory: %v", err)
 	}
-	
+
 	// Create output file
 	output, err := os.Create(outputPath)
 	if err != nil {
@@ -403,7 +403,7 @@ func (r *DMGReader) ExtractPartition(partitionIndex int, outputPath string) erro
 			if err != nil {
 				return fmt.Errorf("failed to decompress zlib data: %v", err)
 			}
-			
+
 			if r.verbose {
 				fmt.Printf("Decompressed %d bytes of zlib data\n", n)
 			}
@@ -411,16 +411,16 @@ func (r *DMGReader) ExtractPartition(partitionIndex int, outputPath string) erro
 		case blockTypeBZip2:
 			// bzip2 compressed data
 			bzr := bzip2.NewReader(bytes.NewReader(compressedData))
-			
+
 			n, err := io.CopyBuffer(output, bzr, buffer)
 			if err != nil {
 				return fmt.Errorf("failed to decompress bzip2 data: %v", err)
 			}
-			
+
 			if r.verbose {
 				fmt.Printf("Decompressed %d bytes of bzip2 data\n", n)
 			}
-			
+
 		case blockTypeADC:
 			return fmt.Errorf("ADC compression not implemented yet")
 
@@ -432,7 +432,7 @@ func (r *DMGReader) ExtractPartition(partitionIndex int, outputPath string) erro
 	if r.verbose {
 		fmt.Println("Extraction completed successfully")
 	}
-	
+
 	return nil
 }
 
@@ -445,8 +445,8 @@ func (r *DMGReader) ExtractAllPartitions(outputDir string) error {
 
 	for i, partition := range r.partitions {
 		// Skip certain system partitions that are not useful
-		if strings.Contains(partition.Name, "Driver Descriptor Map") || 
-		   strings.Contains(partition.Name, "partition_map") {
+		if strings.Contains(partition.Name, "Driver Descriptor Map") ||
+			strings.Contains(partition.Name, "partition_map") {
 			if r.verbose {
 				fmt.Printf("Skipping system partition: %s\n", partition.Name)
 			}
@@ -458,9 +458,9 @@ func (r *DMGReader) ExtractAllPartitions(outputDir string) error {
 		safeName = strings.Replace(safeName, "(", "", -1)
 		safeName = strings.Replace(safeName, ")", "", -1)
 		safeName = strings.Replace(safeName, ":", "_", -1)
-		
+
 		outputPath := filepath.Join(outputDir, fmt.Sprintf("%d_%s.bin", i, safeName))
-		
+
 		if err := r.ExtractPartition(i, outputPath); err != nil {
 			return fmt.Errorf("failed to extract partition %d: %v", i, err)
 		}
@@ -477,28 +477,28 @@ func (r *DMGReader) MountPartition(partitionIndex int) (string, error) {
 	}
 
 	partition := r.partitions[partitionIndex]
-	
+
 	// Create temporary directory
 	tempDir, err := fsutil.CreateTempDir("dmg_mount_")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temporary directory: %v", err)
 	}
-	
+
 	// Create a safe filename from the partition name
 	safeName := strings.Replace(partition.Name, " ", "_", -1)
 	safeName = strings.Replace(safeName, "(", "", -1)
 	safeName = strings.Replace(safeName, ")", "", -1)
 	safeName = strings.Replace(safeName, ":", "_", -1)
-	
+
 	outputPath := filepath.Join(tempDir, fmt.Sprintf("%s.bin", safeName))
-	
+
 	// Extract partition to temporary location
 	if err := r.ExtractPartition(partitionIndex, outputPath); err != nil {
 		// Clean up on failure
 		fsutil.DeleteDirRecursive(tempDir)
 		return "", err
 	}
-	
+
 	return outputPath, nil
 }
 
