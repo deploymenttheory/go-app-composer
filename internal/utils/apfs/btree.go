@@ -316,7 +316,7 @@ func (bt *BTree) GetKey(index uint32) ([]byte, error) {
 	if bt.fixedKVSize {
 		// Fixed size keys
 		keyOff = kvoff[index].K
-		keyLen = bt.keySize
+		keyLen = uint16(bt.keySize)
 	} else {
 		// Variable size keys
 		keyOff = kvloc[index].K.Off
@@ -353,7 +353,7 @@ func (bt *BTree) GetValue(index uint32) ([]byte, error) {
 	if bt.fixedKVSize {
 		// Fixed size values
 		valOff = kvoff[index].V
-		valLen = bt.valSize
+		valLen = uint16(bt.valSize)
 		isGhost = valOff == BtoffInvalid
 	} else {
 		// Variable size values

@@ -18,6 +18,9 @@ var (
 	ErrInvalidObjectType     = errors.New("invalid object type")
 	ErrInvalidNameLength     = errors.New("invalid name length")
 	ErrVariableLengthMissing = errors.New("variable length field missing")
+	ErrNotFound              = errors.New("object not found")
+	ErrNotImplemented        = errors.New("feature not implemented")
+	ErrNoKeyAvailable        = errors.New("no encryption key available")
 )
 
 // Magic values from APFS specification
