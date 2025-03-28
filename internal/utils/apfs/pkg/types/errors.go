@@ -60,7 +60,7 @@ var (
 	// B-tree errors
 	ErrInvalidBtree        = errors.New("invalid B-tree")
 	ErrInvalidBtreeNode    = errors.New("invalid B-tree node")
-	ErrBtreeNodeFull       = errors.New("B-tree node is full")
+	ErrBtreeNodeFull       = errors.New("b-tree node is full")
 	ErrInvalidBTreeKey     = errors.New("invalid b tree key")
 	ErrInvalidBTreeKeySize = errors.New("invalid b tree key size")
 	ErrKeyNotFound         = errors.New("key not found")

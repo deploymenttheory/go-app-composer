@@ -567,3 +567,48 @@ const (
 	APFSGPTPartitionUUID          string = "7C3457EF-0000-11AA-AA11-00306543ECAC"
 	APFSFVPersonalRecoveryKeyUUID string = "EBC6C064-0000-11AA-AA11-00306543ECAC"
 )
+
+// -------------------------------------------------------------------
+// Constants for obj_phys_t.o_type (32-bit type + flags)
+// Reference: Apple File System Reference — Object Type Masks (page 13–14)
+// -------------------------------------------------------------------
+
+const (
+	// Mask to extract the object type from the low 16 bits of o_type
+	OBJECT_TYPE_MASK = 0x0000ffff
+
+	// Mask to extract all flags from the high 16 bits of o_type
+	OBJECT_TYPE_FLAGS_MASK = 0xffff0000
+
+	// Mask to extract only defined flag bits (subset of high bits)
+	OBJECT_TYPE_FLAGS_DEFINED_MASK = 0xf8000000
+
+	// Mask to extract storage type bits (used to distinguish physical/virtual/ephemeral)
+	OBJ_STORAGETYPE_MASK = 0xc0000000
+)
+
+// Storage type flags for o_type (mutually exclusive)
+const (
+	OBJ_VIRTUAL       = 0x00000000 // No bits set = virtual object
+	OBJ_EPHEMERAL     = 0x80000000 // Bit 31 set
+	OBJ_PHYSICAL      = 0x40000000 // Bit 30 set
+	OBJ_NOHEADER      = 0x20000000 // Object does not use obj_phys_t header
+	OBJ_ENCRYPTED     = 0x10000000 // Object is encrypted
+	OBJ_NONPERSISTENT = 0x08000000 // Ephemeral object that does not persist across unmount
+)
+
+// -------------------------------------------------------------------
+// Constants for j_key_t.j_oid (64-bit packed object ID and type)
+// Reference: Apple File System Reference — j_key_t / j_inode_key_t (page ~73)
+// -------------------------------------------------------------------
+
+const (
+	// Mask to extract the object ID from j_oid (low 60 bits)
+	OBJ_ID_MASK = 0x0fffffffffffffff
+
+	// Bit position where the object type begins in j_oid (bits 60–63)
+	OBJ_TYPE_SHIFT = 60
+
+	// Mask to extract the object type from j_oid (high 4 bits)
+	OBJECT_TYPE_MASK_JKEY = 0xf000000000000000
+)
