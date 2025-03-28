@@ -257,22 +257,6 @@ type DirectoryEntry struct {
 	Flags     uint16   // Flags
 }
 
-// ExtendedAttribute represents an extended attribute
-type ExtendedAttribute struct {
-	Name   string // Attribute name
-	Data   []byte // Attribute data
-	Flags  uint16 // Flags
-	FileID OID    // File ID
-}
-
-// ExtendedField represents an extended field in an inode or directory entry
-type ExtendedField struct {
-	Type  uint8  // Field type
-	Flags uint8  // Field flags
-	Size  uint16 // Field size
-	Data  []byte // Field data
-}
-
 // DataStream represents information about a data stream
 type DataStream struct {
 	Size              uint64 // Logical size in bytes
@@ -373,16 +357,4 @@ type ObjectResolver interface {
 
 	// ReadPhysicalObject reads an object at a specific physical address
 	ReadPhysicalObject(addr PAddr) ([]byte, error)
-}
-
-// VersionInfo contains information about the APFS version
-type VersionInfo struct {
-	Major           uint16 // Major version
-	Minor           uint16 // Minor version
-	IncompatFlags   uint64 // Incompatible features
-	ROCompatFlags   uint64 // Read-only compatible features
-	CompatFlags     uint64 // Compatible features
-	FormattedBy     string // Formatted by
-	LastModifiedBy  string // Last modified by
-	LastModifiedXID XID    // Last modified transaction ID
 }

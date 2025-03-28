@@ -18,7 +18,11 @@ apfs/
     ├── types/               # Core types and constants
     │   ├── constants.go     # All APFS constants from the spec
     │   ├── errors.go        # Error definitions
-    │   └── types.go         # Common data structures
+    │   ├── types.go         # Common data structures and interfaces
+    │   ├── interfaces.go    # Extended interfaces
+    │   ├── structs.go       # All APFS on-disk data structures as Go structs
+    │   ├── binary.go        # Serialization/deserialization helpers
+    │   └── version.go       # Version compatibility checking
     ├── container/           # Container layer
     │   ├── object.go        # Object structures (obj_phys_t)
     │   ├── checkpoint.go    # Checkpoint mechanism
@@ -52,6 +56,7 @@ apfs/
     └── util/                # Utilities
         ├── io.go            # I/O utilities
         ├── checksum.go      # Fletcher64 implementation
+        ├── bits.go          # Bit manipulation utilities
         └── uuid.go          # UUID handling
 ```
 

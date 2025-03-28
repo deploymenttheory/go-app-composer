@@ -10,12 +10,26 @@ const (
 	MaxCksumSize uint32 = 8 // Maximum checksum size
 )
 
-// Block size constants
+// -------------------------------------------------------------------
+// Limits and structural bounds
+// Reference: Apple File System Reference — nx_superblock_t (page ~32)
+// -------------------------------------------------------------------
+
+// Block size constants and structural limits
 const (
-	MinBlockSize     uint32 = 4096
-	DefaultBlockSize uint32 = 4096
-	MaxBlockSize     uint32 = 65536
-	MinContainerSize uint64 = 1048576
+	MinBlockSize     uint32 = 4096    // Minimum supported block size
+	DefaultBlockSize uint32 = 4096    // Default block size used in most containers
+	MaxBlockSize     uint32 = 65536   // Maximum supported block size
+	MinContainerSize uint64 = 1048576 // Minimum container size in bytes (1 MiB)
+
+	NXMaxFileSystems           = 100  // Maximum number of file systems (volumes) in a container
+	NXMaxXPDescBlocks          = 32   // Maximum number of checkpoint descriptor blocks
+	NXMaxXPDataBlocks          = 8192 // Maximum number of checkpoint data blocks
+	NXNumCounters              = 32   // Number of counters in nx_superblock_t
+	NXEphemeralInfoCount       = 4    // Number of ephemeral_info[] entries in nx_superblock_t
+	SpacemanFreeQueueCount     = 3    // Number of spaceman free queues (internal, main, tier2)
+	MaxSnapshotMetadataRecords = 1024 // Max entries in the snapshot metadata tree
+	APFSMaxVolumeRoles         = 32   // Number of roles representable in a volume role bitmask
 )
 
 // Object identifier constants
@@ -540,19 +554,19 @@ const (
 
 // Encryption rolling flags
 const (
-	ERSBFlagEncrypting       uint32 = 0x00000001
-	ERSBFlagDecrypting       uint32 = 0x00000002
-	ERSBFlagKeyrolling       uint32 = 0x00000004
-	ERSBFlagPaused           uint32 = 0x00000008
-	ERSBFlagFailed           uint32 = 0x00000010
-	ERSBFlagCidIsTweak       uint32 = 0x00000020
-	ERSBFlagFree1            uint32 = 0x00000040
-	ERSBFlagFree2            uint32 = 0x00000080
-	ERSBFlagCMBlockSizeMask  uint32 = 0x00000F00
-	ERSBFlagCMBlockSizeShift uint32 = 8
-	ERSBFlagERPhaseMask      uint32 = 0x00003000
-	ERSBFlagERPhaseShift     uint32 = 12
-	ERSBFlagFromOnekey       uint32 = 0x00004000
+	ERSBFlagEncrypting       uint64 = 0x0000000000000001
+	ERSBFlagDecrypting       uint64 = 0x0000000000000002
+	ERSBFlagKeyrolling       uint64 = 0x0000000000000004
+	ERSBFlagPaused           uint64 = 0x0000000000000008
+	ERSBFlagFailed           uint64 = 0x0000000000000010
+	ERSBFlagCidIsTweak       uint64 = 0x0000000000000020
+	ERSBFlagFree1            uint64 = 0x0000000000000040
+	ERSBFlagFree2            uint64 = 0x0000000000000080
+	ERSBFlagCMBlockSizeMask  uint64 = 0x0000000000000F00
+	ERSBFlagCMBlockSizeShift        = 8
+	ERSBFlagERPhaseMask      uint64 = 0x0000000000003000
+	ERSBFlagERPhaseShift            = 12
+	ERSBFlagFromOnekey       uint64 = 0x0000000000004000
 )
 
 // Encryption rolling phases
@@ -611,4 +625,15 @@ const (
 
 	// Mask to extract the object type from j_oid (high 4 bits)
 	OBJECT_TYPE_MASK_JKEY = 0xf000000000000000
+)
+
+// -------------------------------------------------------------------
+// Directory Record (j_drec_hashed_key_t) masks
+// Reference: Apple File System Reference, page ~78
+// -------------------------------------------------------------------
+
+const (
+	JDrecLenMask   uint32 = 0x000003FF // Lower 10 bits: name length
+	JDrecHashMask  uint32 = 0xFFFFFC00 // Upper 22 bits: name hash
+	JDrecHashShift uint32 = 10         // Hash is shifted by 10 bits
 )
