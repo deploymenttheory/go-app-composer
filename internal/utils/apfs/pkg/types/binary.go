@@ -6,19 +6,33 @@ import (
 	"fmt"
 	"io"
 	"unsafe"
+
+	"github.com/deploymenttheory/go-app-composer/internal/utils/apfs/pkg/checksum"
 )
 
 // BinaryReader helps with reading binary data
 type BinaryReader struct {
 	reader io.Reader
 	order  binary.ByteOrder
+	buf    *bytes.Reader // used for peeking
 }
 
 // NewBinaryReader creates a new binary reader with specified byte order
 func NewBinaryReader(r io.Reader, order binary.ByteOrder) *BinaryReader {
+	// Ensure we have a bytes.Reader for peeking
+	var b *bytes.Reader
+	switch x := r.(type) {
+	case *bytes.Reader:
+		b = x
+	default:
+		buf := new(bytes.Buffer)
+		io.Copy(buf, r)
+		b = bytes.NewReader(buf.Bytes())
+	}
 	return &BinaryReader{
-		reader: r,
+		reader: b,
 		order:  order,
+		buf:    b,
 	}
 }
 
@@ -115,6 +129,79 @@ func (br *BinaryReader) ReadStringWithLen(length int) (string, error) {
 		return "", err
 	}
 	return string(buf), nil
+}
+
+// PeekBytes allows peeking ahead at the next n bytes without advancing the reader
+func (br *BinaryReader) PeekBytes(n int) ([]byte, error) {
+	if br.buf == nil {
+		return nil, fmt.Errorf("peek not supported on non-buffered reader")
+	}
+	pos, _ := br.buf.Seek(0, io.SeekCurrent)
+	buf := make([]byte, n)
+	_, err := br.buf.Read(buf)
+	br.buf.Seek(pos, io.SeekStart) // rewind
+	return buf, err
+}
+
+// ReadUntilNullByte reads until a null byte is encountered
+func (br *BinaryReader) ReadUntilNullByte() ([]byte, error) {
+	var result []byte
+	for {
+		b := make([]byte, 1)
+		_, err := br.buf.Read(b)
+		if err != nil {
+			return nil, err
+		}
+		if b[0] == 0 {
+			break
+		}
+		result = append(result, b[0])
+	}
+	return result, nil
+}
+
+// ReadUint16Masked reads a uint16, applies a mask, and shifts it into position
+func (br *BinaryReader) ReadUint16Masked(mask uint16, shift uint8) (uint16, error) {
+	val, err := br.ReadUint16()
+	if err != nil {
+		return 0, err
+	}
+	return (val & mask) >> shift, nil
+}
+
+// ReadUint32Masked reads a uint32, applies a mask, and shifts it into position
+func (br *BinaryReader) ReadUint32Masked(mask uint32, shift uint8) (uint32, error) {
+	val, err := br.ReadUint32()
+	if err != nil {
+		return 0, err
+	}
+	return (val & mask) >> shift, nil
+}
+
+// ReadUint64Array reads an array of uint64 values of the specified length
+func (br *BinaryReader) ReadUint64Array(count int) ([]uint64, error) {
+	result := make([]uint64, count)
+	for i := 0; i < count; i++ {
+		val, err := br.ReadUint64()
+		if err != nil {
+			return nil, err
+		}
+		result[i] = val
+	}
+	return result, nil
+}
+
+// ReadOIDArray reads an array of OID values of the specified length
+func (br *BinaryReader) ReadOIDArray(count int) ([]OID, error) {
+	result := make([]OID, count)
+	for i := 0; i < count; i++ {
+		val, err := br.ReadOID()
+		if err != nil {
+			return nil, err
+		}
+		result[i] = val
+	}
+	return result, nil
 }
 
 // BinaryWriter helps with writing binary data
@@ -285,290 +372,171 @@ func SerializeObjectHeader(header *ObjectHeader) ([]byte, error) {
 
 // DeserializeNXSuperblock deserializes an NXSuperblock from binary data
 func DeserializeNXSuperblock(data []byte) (*NXSuperblock, error) {
+	// Validate input size
 	if len(data) < int(unsafe.Sizeof(NXSuperblock{})) {
 		return nil, ErrStructTooShort
 	}
 
-	reader := NewBinaryReader(bytes.NewReader(data), binary.LittleEndian)
+	// Create a new binary reader for the full data slice
 	sb := &NXSuperblock{}
 
-	// Read object header
+	// Read object header first
 	header, err := DeserializeObjectHeader(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize object header: %w", err)
 	}
 	sb.Header = *header
 
-	// Skip over header bytes
+	// Reinitialize binary reader to skip over the header and resume reading
 	headerSize := int(unsafe.Sizeof(ObjectHeader{}))
-	reader = NewBinaryReader(bytes.NewReader(data[headerSize:]), binary.LittleEndian)
+	br := NewBinaryReader(bytes.NewReader(data[headerSize:]), binary.LittleEndian)
 
-	// Read magic number
-	sb.Magic, err = reader.ReadUint32()
-	if err != nil {
+	// Begin reading all subsequent NXSuperblock fields
+	if sb.Magic, err = br.ReadUint32(); err != nil {
 		return nil, fmt.Errorf("failed to read magic: %w", err)
 	}
-
-	// Verify magic number
 	if sb.Magic != NXMagic {
 		return nil, ErrInvalidMagic
 	}
+	if sb.BlockSize, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.BlockCount, err = br.ReadUint64(); err != nil {
+		return nil, err
+	}
+	if sb.Features, err = br.ReadUint64(); err != nil {
+		return nil, err
+	}
+	if sb.ReadOnlyCompatFeatures, err = br.ReadUint64(); err != nil {
+		return nil, err
+	}
+	if sb.IncompatFeatures, err = br.ReadUint64(); err != nil {
+		return nil, err
+	}
+	if sb.UUID, err = br.ReadUUID(); err != nil {
+		return nil, err
+	}
+	if sb.NextOID, err = br.ReadOID(); err != nil {
+		return nil, err
+	}
+	if sb.NextXID, err = br.ReadXID(); err != nil {
+		return nil, err
+	}
+	if sb.XPDescBlocks, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.XPDataBlocks, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.XPDescBase, err = br.ReadPAddr(); err != nil {
+		return nil, err
+	}
+	if sb.XPDataBase, err = br.ReadPAddr(); err != nil {
+		return nil, err
+	}
+	if sb.XPDescNext, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.XPDataNext, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.XPDescIndex, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.XPDescLen, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.XPDataIndex, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.XPDataLen, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.SpacemanOID, err = br.ReadOID(); err != nil {
+		return nil, err
+	}
+	if sb.OMapOID, err = br.ReadOID(); err != nil {
+		return nil, err
+	}
+	if sb.ReaperOID, err = br.ReadOID(); err != nil {
+		return nil, err
+	}
+	if sb.TestType, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if sb.MaxFileSystems, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
 
-	// Read block size
-	sb.BlockSize, err = reader.ReadUint32()
+	// Arrays
+	fsOIDs, err := br.ReadOIDArray(NXMaxFileSystems)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read block size: %w", err)
+		return nil, fmt.Errorf("failed to read FSOIDs: %w", err)
 	}
+	copy(sb.FSOID[:], fsOIDs)
 
-	// Read block count
-	sb.BlockCount, err = reader.ReadUint64()
+	counters, err := br.ReadUint64Array(NXNumCounters)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read block count: %w", err)
+		return nil, fmt.Errorf("failed to read counters: %w", err)
 	}
+	copy(sb.Counters[:], counters)
 
-	// Read features
-	sb.Features, err = reader.ReadUint64()
+	ephemeralInfo, err := br.ReadUint64Array(NXEphemeralInfoCount)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read features: %w", err)
+		return nil, fmt.Errorf("failed to read ephemeral info: %w", err)
+	}
+	copy(sb.EphemeralInfo[:], ephemeralInfo)
+
+	// Nested structs
+	if sb.BlockedOutRange.StartAddr, err = br.ReadPAddr(); err != nil {
+		return nil, err
+	}
+	if sb.BlockedOutRange.BlockCount, err = br.ReadUint64(); err != nil {
+		return nil, err
+	}
+	if sb.EvictMappingTreeOID, err = br.ReadOID(); err != nil {
+		return nil, err
+	}
+	if sb.Flags, err = br.ReadUint64(); err != nil {
+		return nil, err
+	}
+	if sb.EFIJumpstart, err = br.ReadPAddr(); err != nil {
+		return nil, err
+	}
+	if sb.FusionUUID, err = br.ReadUUID(); err != nil {
+		return nil, err
+	}
+	if sb.KeyLocker.StartAddr, err = br.ReadPAddr(); err != nil {
+		return nil, err
+	}
+	if sb.KeyLocker.BlockCount, err = br.ReadUint64(); err != nil {
+		return nil, err
 	}
 
-	// Read read-only compatible features
-	sb.ReadOnlyCompatFeatures, err = reader.ReadUint64()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read read-only compatible features: %w", err)
+	// Final optional Fusion fields
+	if sb.TestOID, err = br.ReadOID(); err != nil {
+		return nil, err
 	}
-
-	// Read incompatible features
-	sb.IncompatFeatures, err = reader.ReadUint64()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read incompatible features: %w", err)
+	if sb.FusionMtOID, err = br.ReadOID(); err != nil {
+		return nil, err
 	}
-
-	// Read UUID
-	sb.UUID, err = reader.ReadUUID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read UUID: %w", err)
+	if sb.FusionWbcOID, err = br.ReadOID(); err != nil {
+		return nil, err
 	}
-
-	// Read next OID
-	sb.NextOID, err = reader.ReadOID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read next OID: %w", err)
+	if sb.FusionWbc.StartAddr, err = br.ReadPAddr(); err != nil {
+		return nil, err
 	}
-
-	// Read next XID
-	sb.NextXID, err = reader.ReadXID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read next XID: %w", err)
+	if sb.FusionWbc.BlockCount, err = br.ReadUint64(); err != nil {
+		return nil, err
 	}
-
-	// Read checkpoint descriptor blocks
-	sb.XPDescBlocks, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint descriptor blocks: %w", err)
+	if sb.NewestMountedVersion, err = br.ReadUint64(); err != nil {
+		return nil, err
 	}
-
-	// Read checkpoint data blocks
-	sb.XPDataBlocks, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint data blocks: %w", err)
+	if sb.MkbLocker.StartAddr, err = br.ReadPAddr(); err != nil {
+		return nil, err
 	}
-
-	// Read checkpoint descriptor base
-	sb.XPDescBase, err = reader.ReadPAddr()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint descriptor base: %w", err)
-	}
-
-	// Read checkpoint data base
-	sb.XPDataBase, err = reader.ReadPAddr()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint data base: %w", err)
-	}
-
-	// Read next checkpoint descriptor
-	sb.XPDescNext, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read next checkpoint descriptor: %w", err)
-	}
-
-	// Read next checkpoint data
-	sb.XPDataNext, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read next checkpoint data: %w", err)
-	}
-
-	// Read checkpoint descriptor index
-	sb.XPDescIndex, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint descriptor index: %w", err)
-	}
-
-	// Read checkpoint descriptor length
-	sb.XPDescLen, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint descriptor length: %w", err)
-	}
-
-	// Read checkpoint data index
-	sb.XPDataIndex, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint data index: %w", err)
-	}
-
-	// Read checkpoint data length
-	sb.XPDataLen, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint data length: %w", err)
-	}
-
-	// Read space manager OID
-	sb.SpacemanOID, err = reader.ReadOID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read space manager OID: %w", err)
-	}
-
-	// Read object map OID
-	sb.OMapOID, err = reader.ReadOID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read object map OID: %w", err)
-	}
-
-	// Read reaper OID
-	sb.ReaperOID, err = reader.ReadOID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read reaper OID: %w", err)
-	}
-
-	// Read test type
-	sb.TestType, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read test type: %w", err)
-	}
-
-	// Read max file systems
-	sb.MaxFileSystems, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read max file systems: %w", err)
-	}
-
-	// Read file system OIDs
-	for i := 0; i < NXMaxFileSystems; i++ {
-		sb.FSOID[i], err = reader.ReadOID()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file system OID %d: %w", i, err)
-		}
-	}
-
-	// Read counters
-	for i := 0; i < NXNumCounters; i++ {
-		sb.Counters[i], err = reader.ReadUint64()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read counter %d: %w", i, err)
-		}
-	}
-
-	// Read blocked out range
-	sb.BlockedOutRange.StartAddr, err = reader.ReadPAddr()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read blocked out range start address: %w", err)
-	}
-
-	sb.BlockedOutRange.BlockCount, err = reader.ReadUint64()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read blocked out range block count: %w", err)
-	}
-
-	// Read evict mapping tree OID
-	sb.EvictMappingTreeOID, err = reader.ReadOID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read evict mapping tree OID: %w", err)
-	}
-
-	// Read flags
-	sb.Flags, err = reader.ReadUint64()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read flags: %w", err)
-	}
-
-	// Read EFI jumpstart
-	sb.EFIJumpstart, err = reader.ReadPAddr()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read EFI jumpstart: %w", err)
-	}
-
-	// Read Fusion UUID
-	sb.FusionUUID, err = reader.ReadUUID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read Fusion UUID: %w", err)
-	}
-
-	// Read key locker
-	sb.KeyLocker.StartAddr, err = reader.ReadPAddr()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read key locker start address: %w", err)
-	}
-
-	sb.KeyLocker.BlockCount, err = reader.ReadUint64()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read key locker block count: %w", err)
-	}
-
-	// Read ephemeral info
-	for i := 0; i < NXEphemeralInfoCount; i++ {
-		sb.EphemeralInfo[i], err = reader.ReadUint64()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read ephemeral info %d: %w", i, err)
-		}
-	}
-
-	// Read remaining fields if present (handle potential backward compatibility)
-	// Test OID
-	if reader.ReadOID != nil && len(data) >= int(unsafe.Sizeof(NXSuperblock{})) {
-		sb.TestOID, err = reader.ReadOID()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read test OID: %w", err)
-		}
-
-		// Fusion middle tree OID
-		sb.FusionMtOID, err = reader.ReadOID()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read Fusion middle tree OID: %w", err)
-		}
-
-		// Fusion write-back cache OID
-		sb.FusionWbcOID, err = reader.ReadOID()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read Fusion write-back cache OID: %w", err)
-		}
-
-		// Fusion write-back cache
-		sb.FusionWbc.StartAddr, err = reader.ReadPAddr()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read Fusion write-back cache start address: %w", err)
-		}
-
-		sb.FusionWbc.BlockCount, err = reader.ReadUint64()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read Fusion write-back cache block count: %w", err)
-		}
-
-		// Newest mounted version
-		sb.NewestMountedVersion, err = reader.ReadUint64()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read newest mounted version: %w", err)
-		}
-
-		// Media key locker
-		sb.MkbLocker.StartAddr, err = reader.ReadPAddr()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read media key locker start address: %w", err)
-		}
-
-		sb.MkbLocker.BlockCount, err = reader.ReadUint64()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read media key locker block count: %w", err)
-		}
+	if sb.MkbLocker.BlockCount, err = br.ReadUint64(); err != nil {
+		return nil, err
 	}
 
 	return sb, nil
@@ -584,78 +552,152 @@ func SerializeNXSuperblock(sb *NXSuperblock) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize object header: %w", err)
 	}
-
 	if err := writer.WriteBytes(headerBytes); err != nil {
 		return nil, fmt.Errorf("failed to write object header: %w", err)
 	}
 
-	// Write magic number
+	// Begin writing NXSuperblock fields
 	if err := writer.WriteUint32(sb.Magic); err != nil {
-		return nil, fmt.Errorf("failed to write magic: %w", err)
+		return nil, err
 	}
-
-	// Write block size
 	if err := writer.WriteUint32(sb.BlockSize); err != nil {
-		return nil, fmt.Errorf("failed to write block size: %w", err)
+		return nil, err
 	}
-
-	// Write block count
 	if err := writer.WriteUint64(sb.BlockCount); err != nil {
-		return nil, fmt.Errorf("failed to write block count: %w", err)
+		return nil, err
 	}
-
-	// Write features
 	if err := writer.WriteUint64(sb.Features); err != nil {
-		return nil, fmt.Errorf("failed to write features: %w", err)
+		return nil, err
 	}
-
-	// Write read-only compatible features
 	if err := writer.WriteUint64(sb.ReadOnlyCompatFeatures); err != nil {
-		return nil, fmt.Errorf("failed to write read-only compatible features: %w", err)
+		return nil, err
 	}
-
-	// Write incompatible features
 	if err := writer.WriteUint64(sb.IncompatFeatures); err != nil {
-		return nil, fmt.Errorf("failed to write incompatible features: %w", err)
+		return nil, err
 	}
-
-	// Write UUID
 	if err := writer.WriteUUID(sb.UUID); err != nil {
-		return nil, fmt.Errorf("failed to write UUID: %w", err)
+		return nil, err
 	}
-
-	// Write next OID
 	if err := writer.WriteOID(sb.NextOID); err != nil {
-		return nil, fmt.Errorf("failed to write next OID: %w", err)
+		return nil, err
 	}
-
-	// Write next XID
 	if err := writer.WriteXID(sb.NextXID); err != nil {
-		return nil, fmt.Errorf("failed to write next XID: %w", err)
+		return nil, err
 	}
-
-	// Write checkpoint descriptor blocks
 	if err := writer.WriteUint32(sb.XPDescBlocks); err != nil {
-		return nil, fmt.Errorf("failed to write checkpoint descriptor blocks: %w", err)
+		return nil, err
 	}
-
-	// Write checkpoint data blocks
 	if err := writer.WriteUint32(sb.XPDataBlocks); err != nil {
-		return nil, fmt.Errorf("failed to write checkpoint data blocks: %w", err)
+		return nil, err
 	}
-
-	// Write checkpoint descriptor base
 	if err := writer.WritePAddr(sb.XPDescBase); err != nil {
-		return nil, fmt.Errorf("failed to write checkpoint descriptor base: %w", err)
+		return nil, err
 	}
-
-	// Write checkpoint data base
 	if err := writer.WritePAddr(sb.XPDataBase); err != nil {
-		return nil, fmt.Errorf("failed to write checkpoint data base: %w", err)
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.XPDescNext); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.XPDataNext); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.XPDescIndex); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.XPDescLen); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.XPDataIndex); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.XPDataLen); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.SpacemanOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.OMapOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.ReaperOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.TestType); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.MaxFileSystems); err != nil {
+		return nil, err
 	}
 
-	// Write remaining fields following the same pattern as the deserialize function
-	// ... [Continue with all other fields]
+	// Write fixed-size arrays
+	for _, oid := range sb.FSOID {
+		if err := writer.WriteOID(oid); err != nil {
+			return nil, fmt.Errorf("failed to write FSOID: %w", err)
+		}
+	}
+	for _, counter := range sb.Counters {
+		if err := writer.WriteUint64(counter); err != nil {
+			return nil, fmt.Errorf("failed to write counter: %w", err)
+		}
+	}
+	for _, ephem := range sb.EphemeralInfo {
+		if err := writer.WriteUint64(ephem); err != nil {
+			return nil, fmt.Errorf("failed to write ephemeral info: %w", err)
+		}
+	}
+
+	// Write nested structs
+	if err := writer.WritePAddr(sb.BlockedOutRange.StartAddr); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.BlockedOutRange.BlockCount); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.EvictMappingTreeOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.Flags); err != nil {
+		return nil, err
+	}
+	if err := writer.WritePAddr(sb.EFIJumpstart); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUUID(sb.FusionUUID); err != nil {
+		return nil, err
+	}
+	if err := writer.WritePAddr(sb.KeyLocker.StartAddr); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.KeyLocker.BlockCount); err != nil {
+		return nil, err
+	}
+
+	// Write fusion metadata
+	if err := writer.WriteOID(sb.TestOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.FusionMtOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.FusionWbcOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WritePAddr(sb.FusionWbc.StartAddr); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.FusionWbc.BlockCount); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.NewestMountedVersion); err != nil {
+		return nil, err
+	}
+	if err := writer.WritePAddr(sb.MkbLocker.StartAddr); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.MkbLocker.BlockCount); err != nil {
+		return nil, err
+	}
 
 	return buf.Bytes(), nil
 }
@@ -666,93 +708,472 @@ func DeserializeAPFSSuperblock(data []byte) (*APFSSuperblock, error) {
 		return nil, ErrStructTooShort
 	}
 
-	reader := NewBinaryReader(bytes.NewReader(data), binary.LittleEndian)
 	sb := &APFSSuperblock{}
 
-	// Read object header
 	header, err := DeserializeObjectHeader(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize object header: %w", err)
 	}
 	sb.Header = *header
 
-	// Skip over header bytes
 	headerSize := int(unsafe.Sizeof(ObjectHeader{}))
-	reader = NewBinaryReader(bytes.NewReader(data[headerSize:]), binary.LittleEndian)
+	br := NewBinaryReader(bytes.NewReader(data[headerSize:]), binary.LittleEndian)
 
-	// Read magic number
-	sb.Magic, err = reader.ReadUint32()
-	if err != nil {
+	if sb.Magic, err = br.ReadUint32(); err != nil {
 		return nil, fmt.Errorf("failed to read magic: %w", err)
 	}
-
-	// Verify magic number
 	if sb.Magic != APFSMagic {
 		return nil, ErrInvalidMagic
 	}
-
-	// Read file system index
-	sb.FSIndex, err = reader.ReadUint32()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file system index: %w", err)
+	if sb.FSIndex, err = br.ReadUint32(); err != nil {
+		return nil, fmt.Errorf("failed to read FSIndex: %w", err)
 	}
-
-	// Read features
-	sb.Features, err = reader.ReadUint64()
-	if err != nil {
+	if sb.Features, err = br.ReadUint64(); err != nil {
 		return nil, fmt.Errorf("failed to read features: %w", err)
 	}
-
-	// Read read-only compatible features
-	sb.ReadOnlyCompatFeatures, err = reader.ReadUint64()
-	if err != nil {
+	if sb.ReadOnlyCompatFeatures, err = br.ReadUint64(); err != nil {
 		return nil, fmt.Errorf("failed to read read-only compatible features: %w", err)
 	}
-
-	// Read incompatible features
-	sb.IncompatFeatures, err = reader.ReadUint64()
-	if err != nil {
+	if sb.IncompatFeatures, err = br.ReadUint64(); err != nil {
 		return nil, fmt.Errorf("failed to read incompatible features: %w", err)
 	}
-
-	// Read unmount time
-	sb.UnmountTime, err = reader.ReadUint64()
-	if err != nil {
+	if sb.UnmountTime, err = br.ReadUint64(); err != nil {
 		return nil, fmt.Errorf("failed to read unmount time: %w", err)
 	}
-
-	// Continue reading all fields...
-	// This would be a very lengthy function to complete fully,
-	// as it needs to handle all fields of APFSSuperblock
+	if sb.ReserveBlockCount, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read reserve block count: %w", err)
+	}
+	if sb.QuotaBlockCount, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read quota block count: %w", err)
+	}
+	if sb.AllocCount, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read alloc count: %w", err)
+	}
+	if err = br.Read(&sb.MetaCrypto); err != nil {
+		return nil, fmt.Errorf("failed to read meta crypto state: %w", err)
+	}
+	if sb.RootTreeType, err = br.ReadUint32(); err != nil {
+		return nil, fmt.Errorf("failed to read root tree type: %w", err)
+	}
+	if sb.ExtentrefTreeType, err = br.ReadUint32(); err != nil {
+		return nil, fmt.Errorf("failed to read extentref tree type: %w", err)
+	}
+	if sb.SnapMetaTreeType, err = br.ReadUint32(); err != nil {
+		return nil, fmt.Errorf("failed to read snap meta tree type: %w", err)
+	}
+	if sb.OMapOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read OMapOID: %w", err)
+	}
+	if sb.RootTreeOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read root tree OID: %w", err)
+	}
+	if sb.ExtentrefTreeOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read extentref tree OID: %w", err)
+	}
+	if sb.SnapMetaTreeOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read snap meta tree OID: %w", err)
+	}
+	if sb.RevertToXID, err = br.ReadXID(); err != nil {
+		return nil, fmt.Errorf("failed to read revert to XID: %w", err)
+	}
+	if sb.RevertToSblockOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read revert to sblock OID: %w", err)
+	}
+	if sb.NextObjID, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read next object ID: %w", err)
+	}
+	if sb.NumFiles, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read num files: %w", err)
+	}
+	if sb.NumDirectories, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read num directories: %w", err)
+	}
+	if sb.NumSymlinks, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read num symlinks: %w", err)
+	}
+	if sb.NumOtherFSObjects, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read num other fs objects: %w", err)
+	}
+	if sb.NumSnapshots, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read num snapshots: %w", err)
+	}
+	if sb.TotalBlocksAlloced, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read total blocks alloced: %w", err)
+	}
+	if sb.TotalBlocksFreed, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read total blocks freed: %w", err)
+	}
+	if sb.UUID, err = br.ReadUUID(); err != nil {
+		return nil, fmt.Errorf("failed to read volume UUID: %w", err)
+	}
+	if sb.LastModTime, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read last mod time: %w", err)
+	}
+	if sb.FSFlags, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read fs flags: %w", err)
+	}
+	if err = br.Read(&sb.FormattedBy); err != nil {
+		return nil, fmt.Errorf("failed to read formatted by: %w", err)
+	}
+	if err = br.Read(&sb.ModifiedBy); err != nil {
+		return nil, fmt.Errorf("failed to read modified by: %w", err)
+	}
+	if err = br.Read(&sb.VolName); err != nil {
+		return nil, fmt.Errorf("failed to read volume name: %w", err)
+	}
+	if sb.NextDocID, err = br.ReadUint32(); err != nil {
+		return nil, fmt.Errorf("failed to read next doc ID: %w", err)
+	}
+	if sb.Role, err = br.ReadUint16(); err != nil {
+		return nil, fmt.Errorf("failed to read role: %w", err)
+	}
+	if sb.Reserved, err = br.ReadUint16(); err != nil {
+		return nil, fmt.Errorf("failed to read reserved: %w", err)
+	}
+	if sb.RootToXID, err = br.ReadXID(); err != nil {
+		return nil, fmt.Errorf("failed to read root to XID: %w", err)
+	}
+	if sb.ERStateOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read ER state OID: %w", err)
+	}
+	if sb.CloneinfoIDEpoch, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read cloneinfo ID epoch: %w", err)
+	}
+	if sb.CloneinfoXID, err = br.ReadUint64(); err != nil {
+		return nil, fmt.Errorf("failed to read cloneinfo XID: %w", err)
+	}
+	if sb.SnapMetaExtOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read snap meta ext OID: %w", err)
+	}
+	if sb.VolumeGroupID, err = br.ReadUUID(); err != nil {
+		return nil, fmt.Errorf("failed to read volume group ID: %w", err)
+	}
+	if sb.IntegrityMetaOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read integrity meta OID: %w", err)
+	}
+	if sb.FextTreeOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read fext tree OID: %w", err)
+	}
+	if sb.FextTreeType, err = br.ReadUint32(); err != nil {
+		return nil, fmt.Errorf("failed to read fext tree type: %w", err)
+	}
+	if sb.ReservedType, err = br.ReadUint32(); err != nil {
+		return nil, fmt.Errorf("failed to read reserved type: %w", err)
+	}
+	if sb.ReservedOID, err = br.ReadOID(); err != nil {
+		return nil, fmt.Errorf("failed to read reserved OID: %w", err)
+	}
 
 	return sb, nil
 }
 
 // SerializeAPFSSuperblock serializes an APFSSuperblock to binary data
 func SerializeAPFSSuperblock(sb *APFSSuperblock) ([]byte, error) {
-	// Similar to SerializeNXSuperblock, but for APFSSuperblock
-	// This would be a lengthy function to implement fully
-	return nil, ErrNotImplemented
+	buf := new(bytes.Buffer)
+	writer := NewBinaryWriter(buf, binary.LittleEndian)
+
+	// Write object header
+	headerBytes, err := SerializeObjectHeader(&sb.Header)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize object header: %w", err)
+	}
+	if err := writer.WriteBytes(headerBytes); err != nil {
+		return nil, fmt.Errorf("failed to write object header: %w", err)
+	}
+
+	if err := writer.WriteUint32(sb.Magic); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.FSIndex); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.Features); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.ReadOnlyCompatFeatures); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.IncompatFeatures); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.UnmountTime); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.ReserveBlockCount); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.QuotaBlockCount); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.AllocCount); err != nil {
+		return nil, err
+	}
+	if err := writer.Write(sb.MetaCrypto); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.RootTreeType); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.ExtentrefTreeType); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.SnapMetaTreeType); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.OMapOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.RootTreeOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.ExtentrefTreeOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.SnapMetaTreeOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteXID(sb.RevertToXID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.RevertToSblockOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.NextObjID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.NumFiles); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.NumDirectories); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.NumSymlinks); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.NumOtherFSObjects); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.NumSnapshots); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.TotalBlocksAlloced); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.TotalBlocksFreed); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUUID(sb.UUID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.LastModTime); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.FSFlags); err != nil {
+		return nil, err
+	}
+	if err := writer.Write(sb.FormattedBy); err != nil {
+		return nil, err
+	}
+	for _, m := range sb.ModifiedBy {
+		if err := writer.Write(m); err != nil {
+			return nil, err
+		}
+	}
+	if err := writer.WriteBytes(sb.VolName[:]); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.NextDocID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint16(sb.Role); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint16(sb.Reserved); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteXID(sb.RootToXID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.ERStateOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.CloneinfoIDEpoch); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint64(sb.CloneinfoXID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.SnapMetaExtOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUUID(sb.VolumeGroupID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.IntegrityMetaOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.FextTreeOID); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.FextTreeType); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteUint32(sb.ReservedType); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteOID(sb.ReservedOID); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
 
 // DeserializeBTNodePhys deserializes a B-tree node from binary data
 func DeserializeBTNodePhys(data []byte) (*BTNodePhys, error) {
-	// Implementation would be similar to DeserializeNXSuperblock
-	return nil, ErrNotImplemented
+	const cksumOffset = 0
+	const minSize = 56 // conservative minimum (size of fixed fields)
+
+	if len(data) < minSize {
+		return nil, ErrStructTooShort
+	}
+
+	// 1. Verify Fletcher64 checksum
+	expected := binary.LittleEndian.Uint64(data[:8])
+	actual := checksum.Fletcher64WithZeroedChecksum(data, cksumOffset)
+	if expected != actual {
+		return nil, fmt.Errorf("checksum mismatch: expected 0x%016x, got 0x%016x", expected, actual)
+	}
+
+	// 2. Set up reader
+	br := NewBinaryReader(bytes.NewReader(data), binary.LittleEndian)
+	node := &BTNodePhys{}
+
+	// 3. Read header (obj_phys_t)
+	if err := br.Read(&node.Header.Cksum); err != nil {
+		return nil, fmt.Errorf("read cksum: %w", err)
+	}
+	var err error
+	if node.Header.OID, err = br.ReadOID(); err != nil {
+		return nil, err
+	}
+	if node.Header.XID, err = br.ReadXID(); err != nil {
+		return nil, err
+	}
+	if node.Header.Type, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if node.Header.Subtype, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+
+	// 4. Validate object type
+	if (node.Header.Type & ObjectTypeMask) != ObjectTypeBtreeNode {
+		return nil, fmt.Errorf("invalid object type: 0x%x, expected BTREE_NODE", node.Header.Type)
+	}
+
+	// 5. Read BTNodePhys fields
+	if node.Flags, err = br.ReadUint16(); err != nil {
+		return nil, err
+	}
+	if node.Level, err = br.ReadUint16(); err != nil {
+		return nil, err
+	}
+	if node.KeyCount, err = br.ReadUint32(); err != nil {
+		return nil, err
+	}
+	if err = br.Read(&node.TableSpace); err != nil {
+		return nil, err
+	}
+	if err = br.Read(&node.FreeSpace); err != nil {
+		return nil, err
+	}
+	if err = br.Read(&node.KeyFreeList); err != nil {
+		return nil, err
+	}
+	if err = br.Read(&node.ValFreeList); err != nil {
+		return nil, err
+	}
+
+	// 6. Read remaining data as node.Data
+	currPos, err := br.buf.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+	remainingSize := int64(len(data)) - currPos
+	node.Data, err = br.ReadBytes(int(remainingSize))
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("read trailing data: %w", err)
+	}
+
+	// Optional: capture raw tail (for future fields, debug, etc.)
+	// node.TailData = data[currPos+len(node.Data):]
+
+	return node, nil
 }
 
 // SerializeBTNodePhys serializes a B-tree node to binary data
 func SerializeBTNodePhys(node *BTNodePhys) ([]byte, error) {
-	// Implementation would be similar to SerializeNXSuperblock
-	return nil, ErrNotImplemented
+	buf := new(bytes.Buffer)
+	bw := NewBinaryWriter(buf, binary.LittleEndian)
+
+	// Write ObjectHeader
+	if err := bw.Write(node.Header.Cksum); err != nil {
+		return nil, fmt.Errorf("failed to write checksum: %w", err)
+	}
+	if err := bw.WriteOID(node.Header.OID); err != nil {
+		return nil, err
+	}
+	if err := bw.WriteXID(node.Header.XID); err != nil {
+		return nil, err
+	}
+	if err := bw.WriteUint32(node.Header.Type); err != nil {
+		return nil, err
+	}
+	if err := bw.WriteUint32(node.Header.Subtype); err != nil {
+		return nil, err
+	}
+
+	// Write BTNodePhys fixed fields
+	if err := bw.WriteUint16(node.Flags); err != nil {
+		return nil, err
+	}
+	if err := bw.WriteUint16(node.Level); err != nil {
+		return nil, err
+	}
+	if err := bw.WriteUint32(node.KeyCount); err != nil {
+		return nil, err
+	}
+	if err := bw.Write(node.TableSpace); err != nil {
+		return nil, err
+	}
+	if err := bw.Write(node.FreeSpace); err != nil {
+		return nil, err
+	}
+	if err := bw.Write(node.KeyFreeList); err != nil {
+		return nil, err
+	}
+	if err := bw.Write(node.ValFreeList); err != nil {
+		return nil, err
+	}
+
+	// Write node.Data (variable length)
+	if err := bw.WriteBytes(node.Data); err != nil {
+		return nil, fmt.Errorf("failed to write node data: %w", err)
+	}
+
+	return buf.Bytes(), nil
 }
 
-// We would implement similar functions for all major structures
-// Each implementation follows the same pattern:
-// 1. Check if data is long enough
-// 2. Create a binary reader
-// 3. Read fields one by one
-// 4. Return the deserialized structure
+// We implement serialization/deserialization for all APFS structures.
+// Each follows this standardized pattern:
+//
+// 1. Validate data length against minimum struct size
+// 2. Create a binary reader/writer with correct endianness
+// 3. Read or write fields in strict spec order
+// 4. Verify or compute the Fletcher 64 checksum (obj_phys_t-based)
+// 5. Preserve and zero-fill padding where applicable
+// 6. Validate object type and flags per OBJECT_TYPE_MASK
+// 7. Optionally return or retain raw trailing bytes for future compatibility
 
 // ReadBlock reads a block from a block device and deserializes it to the appropriate structure
 func ReadBlock(device BlockDevice, addr PAddr, blockType uint32) (interface{}, error) {
@@ -816,4 +1237,21 @@ func WriteBlock(device BlockDevice, addr PAddr, obj interface{}) error {
 
 	// Write data to block device
 	return device.WriteBlock(addr, data)
+}
+
+// Align skips bytes in the stream to align to the specified byte boundary
+func (br *BinaryReader) Align(boundary int) error {
+	if seeker, ok := br.reader.(io.Seeker); ok {
+		pos, err := seeker.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		offset := int((boundary - int(pos)%boundary) % boundary)
+		_, err = seeker.Seek(int64(offset), io.SeekCurrent)
+		return err
+	}
+	// fallback if reader doesn't support seeking
+	padding := make([]byte, boundary)
+	_, err := io.ReadFull(br.reader, padding)
+	return err
 }

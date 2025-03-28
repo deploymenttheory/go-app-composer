@@ -1,5 +1,5 @@
-// File: pkg/util/checksum_test.go
-package util
+// File: pkg/checksum/checksum_test.go
+package checksum
 
 import "testing"
 
