@@ -1,3 +1,4 @@
+// interfaces.go extends the types of types.go
 package types
 
 import (

@@ -15,6 +15,8 @@ apfs/
 ├── internal/                # Non-exported internal packages
 │   └── binary/              # Binary parsing utilities
 └── pkg/                     # Exported package code
+    ├── checksum/            # Checksum
+    │   └── fletcher64.go    # Checksum algorithm
     ├── types/               # Core types and constants
     │   ├── constants.go     # All APFS constants from the spec
     │   ├── errors.go        # Error definitions
